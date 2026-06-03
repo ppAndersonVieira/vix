@@ -196,21 +196,30 @@ func NewFromModel(spec string, plugin PluginConfig, effort string, maxTokens int
 		MiniMax:    miniMaxOptsFromEnv(),
 		MiMo:       miMoOptsFromEnv(),
 	}
+	var client Client
 	switch prov {
 	case ProviderAnthropic:
-		return NewAnthropic(cfg)
+		client, err = NewAnthropic(cfg)
 	case ProviderBedrock:
-		return NewBedrock(cfg)
+		client, err = NewBedrock(cfg)
 	case ProviderOpenAI:
-		return NewOpenAI(cfg)
+		client, err = NewOpenAI(cfg)
 	case ProviderOpenRouter:
-		return NewOpenRouter(cfg)
+		client, err = NewOpenRouter(cfg)
 	case ProviderMiniMax:
-		return NewMiniMax(cfg)
+		client, err = NewMiniMax(cfg)
 	case ProviderMiMo:
-		return NewMiMo(cfg)
+		client, err = NewMiMo(cfg)
+	default:
+		return nil, fmt.Errorf("unsupported provider: %s", prov)
 	}
-	return nil, fmt.Errorf("unsupported provider: %s", prov)
+	if err != nil {
+		return nil, err
+	}
+	if globalRPM > 0 {
+		return &rateLimitedClient{inner: client}, nil
+	}
+	return client, nil
 }
 
 func openRouterOptsFromEnv() OpenRouterOptions {

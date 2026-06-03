@@ -15,69 +15,13 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/kirby88/vix/internal/config"
 )
-
-// bedrockRPMLimit returns the configured requests-per-minute cap for Bedrock,
-// read from VIX_BEDROCK_RPM. Returns 0 when the variable is unset or invalid,
-// which disables rate limiting (the default for production accounts).
-func bedrockRPMLimit() int {
-	v := os.Getenv("VIX_BEDROCK_RPM")
-	if v == "" {
-		return 0
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
-		return 0
-	}
-	return n
-}
-
-// Sliding-window state for the optional Bedrock RPM limiter.
-var (
-	bedrockRateMu       sync.Mutex
-	bedrockRequestTimes []time.Time
-)
-
-// bedrockWaitForSlot blocks until a request slot is available under the
-// VIX_BEDROCK_RPM cap. It is a no-op when the cap is 0 (disabled).
-func bedrockWaitForSlot(ctx context.Context) error {
-	maxRPM := bedrockRPMLimit()
-	if maxRPM == 0 {
-		return nil
-	}
-	const window = time.Minute
-	for {
-		bedrockRateMu.Lock()
-		now := time.Now()
-		cutoff := now.Add(-window)
-		i := 0
-		for i < len(bedrockRequestTimes) && bedrockRequestTimes[i].Before(cutoff) {
-			i++
-		}
-		bedrockRequestTimes = bedrockRequestTimes[i:]
-		if len(bedrockRequestTimes) < maxRPM {
-			bedrockRequestTimes = append(bedrockRequestTimes, now)
-			bedrockRateMu.Unlock()
-			return nil
-		}
-		waitUntil := bedrockRequestTimes[0].Add(window)
-		wait := time.Until(waitUntil)
-		bedrockRateMu.Unlock()
-		log.Printf("[bedrock] rate slot full (%d/min), waiting %v", maxRPM, wait.Round(time.Second))
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
-		}
-	}
-}
 
 const bedrockAnthropicVersion = "bedrock-2023-05-31"
 
@@ -177,14 +121,10 @@ func (b *bedrockClient) StreamMessageWith(
 	log.Printf("[llm req=%s] stream_start provider=bedrock model=%s max_tokens=%d messages=%d tools=%d",
 		reqID, b.model, maxTokens, len(messages), len(tools))
 
-	if err := bedrockWaitForSlot(ctx); err != nil {
-		return nil, 0, err
-	}
+	endpointURL := fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/invoke-with-response-stream",
+		url.PathEscape(b.region), url.PathEscape(b.model))
 
-	url := fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/invoke-with-response-stream",
-		b.region, b.model)
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, 0, fmt.Errorf("bedrock: create request: %w", err)
 	}
@@ -201,7 +141,7 @@ func (b *bedrockClient) StreamMessageWith(
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		log.Printf("[llm req=%s] SSE stream error after 0 events: POST %q: %d %s %s",
-			reqID, url, resp.StatusCode, resp.Status, string(raw))
+			reqID, endpointURL, resp.StatusCode, resp.Status, string(raw))
 		return nil, 0, b.httpStatusError(resp.StatusCode, resp.Status, raw)
 	}
 
@@ -214,21 +154,23 @@ func (b *bedrockClient) StreamMessageWith(
 
 // httpStatusError maps an HTTP status to a typed error recognisable by classifyError.
 func (b *bedrockClient) httpStatusError(code int, status string, body []byte) error {
-	// Wrap in a minimal struct that classifyError can inspect via the string path.
 	msg := string(body)
 	if msg == "" {
 		msg = status
 	}
-	return &bedrockHTTPError{code: code, msg: msg}
+	return &BedrockHTTPError{Code: code, Msg: msg}
 }
 
-type bedrockHTTPError struct {
-	code int
-	msg  string
+// BedrockHTTPError is a typed error for non-2xx Bedrock HTTP responses.
+// Exported so classifyError in the daemon layer can use errors.As for
+// robust classification without string matching.
+type BedrockHTTPError struct {
+	Code int
+	Msg  string
 }
 
-func (e *bedrockHTTPError) Error() string {
-	return fmt.Sprintf("bedrock HTTP %d: %s", e.code, e.msg)
+func (e *BedrockHTTPError) Error() string {
+	return fmt.Sprintf("bedrock HTTP %d: %s", e.Code, e.Msg)
 }
 
 // classifyError recognises bedrockHTTPError via string fallback in errors.go;
@@ -261,7 +203,8 @@ func readFrame(r io.Reader) (*frame, error) {
 	}
 	totalLen := binary.BigEndian.Uint32(prelude[0:4])
 	headersLen := binary.BigEndian.Uint32(prelude[4:8])
-	if totalLen < 16 || headersLen > totalLen-16 {
+	const maxFrameSize = 512 * 1024 // 512 KB — well above any real chunk
+	if totalLen < 16 || headersLen > totalLen-16 || totalLen > maxFrameSize {
 		return nil, fmt.Errorf("bedrock eventstream: malformed frame (total=%d headers=%d)", totalLen, headersLen)
 	}
 
@@ -411,7 +354,10 @@ func (b *bedrockClient) runStream(
 		select {
 		case fr := <-frameCh:
 			if fr.err == io.EOF || fr.err == io.ErrUnexpectedEOF {
-				break
+				// Abrupt EOF before the clean empty-event-type terminator —
+				// treat as a retryable connection loss, not a successful response.
+				log.Printf("[llm req=%s] eventstream truncated after %d frames: %v", reqID, eventCount, fr.err)
+				return nil, fmt.Errorf("bedrock: stream truncated: %w", fr.err)
 			}
 			if fr.err != nil {
 				log.Printf("[llm req=%s] eventstream error after %d frames: %v", reqID, eventCount, fr.err)
@@ -442,9 +388,9 @@ func (b *bedrockClient) runStream(
 			case "internalServerException", "modelStreamErrorException", "validationException":
 				return nil, fmt.Errorf("bedrock stream error (%s): %s", fr.f.eventType, string(fr.f.payload))
 			case "throttlingException":
-				return nil, &bedrockHTTPError{code: 429, msg: "throttling: " + string(fr.f.payload)}
+				return nil, &BedrockHTTPError{Code: 429, Msg: "throttling: " + string(fr.f.payload)}
 			case "":
-				// end-of-stream marker frame (empty event type)
+				// Clean end-of-stream marker (empty event type) — success.
 				return acc.toMessage(), nil
 			}
 			continue
@@ -454,8 +400,6 @@ func (b *bedrockClient) runStream(
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
-		// reached only via break on EOF
-		return acc.toMessage(), nil
 	}
 }
 

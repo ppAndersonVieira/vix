@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/kirby88/vix/internal/daemon/llm"
 	"github.com/openai/openai-go"
 )
 
@@ -47,9 +48,12 @@ func isRateLimitError(err error) bool {
 	if errors.As(err, &oaiErr) {
 		return oaiErr.StatusCode == 429
 	}
+	var bedrockErr *llm.BedrockHTTPError
+	if errors.As(err, &bedrockErr) {
+		return bedrockErr.Code == 429
+	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "rate_limit_error") ||
-		strings.Contains(msg, "rate limited by api") ||
 		strings.Contains(msg, "too many requests")
 }
 
@@ -155,16 +159,14 @@ func classifyError(err error) (retryable bool, friendlyMsg string) {
 		}
 	}
 
-	// bedrockHTTPError from the Bedrock adapter (no typed SDK error available).
-	if strings.Contains(err.Error(), "bedrock HTTP ") {
-		lower := strings.ToLower(err.Error())
-		if strings.Contains(lower, "bedrock http 429") || strings.Contains(lower, "too many requests") {
+	var bedrockErr *llm.BedrockHTTPError
+	if errors.As(err, &bedrockErr) {
+		switch {
+		case bedrockErr.Code == 429:
 			return true, "Rate limited by API"
-		}
-		if strings.Contains(lower, "bedrock http 5") {
+		case bedrockErr.Code >= 500:
 			return true, "API server error"
-		}
-		if strings.Contains(lower, "bedrock http 4") {
+		default:
 			return false, "Bad request"
 		}
 	}

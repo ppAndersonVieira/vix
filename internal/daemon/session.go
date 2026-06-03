@@ -28,10 +28,9 @@ type Session struct {
 	id          string
 	parentID    string // non-empty if this session was forked; set once at creation
 	forkTurnIdx int    // which turn it was forked at (0-based); meaningful only when parentID != ""
-	server        *Server
-	llm           LLM
-	model         string
-	modelOverride string // non-empty when --model flag was passed; wins over agent frontmatter
+	server *Server
+	llm    LLM
+	model  string
 	cwd                             string
 	paths                           config.VixPaths
 	forceInit                       bool
@@ -655,7 +654,7 @@ func (s *Session) initBrain() {
 			s.tools = FilterToolSchemasWithBounds(agentCfg.Tools, tDef, tMax)
 			log.Printf("[session] chat agent tools from frontmatter: %v", agentCfg.Tools)
 		}
-		if agentCfg.Model != "" && s.modelOverride == "" {
+		if agentCfg.Model != "" {
 			spec := agentCfg.Model
 			// Every model spec must carry an explicit provider prefix.
 			// Bare names (e.g. legacy "claude-sonnet-4-6") will fail in
@@ -668,16 +667,6 @@ func (s *Session) initBrain() {
 				s.llm = client
 				s.model = spec
 				log.Printf("[session] chat agent model: %s (provider=%s)", spec, client.Provider())
-			}
-		} else if s.modelOverride != "" {
-			spec := s.modelOverride
-			client, err := llm.NewFromModel(spec, s.server.pluginConfig, llm.DefaultEffortFromSpec(spec), int64(agentCfg.MaxTokens))
-			if err != nil {
-				log.Printf("[session] WARN: cannot construct LLM for --model override %q: %v — keeping default", spec, err)
-			} else {
-				s.llm = client
-				s.model = spec
-				log.Printf("[session] model override: %s (provider=%s)", spec, client.Provider())
 			}
 		}
 	}
