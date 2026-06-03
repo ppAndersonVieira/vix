@@ -82,6 +82,10 @@ func Init(cfg Config) {
 			Endpoint:  posthogHost,
 			BatchSize: 20,
 			Interval:  30 * time.Second,
+			// Bound Close() so a flush-on-crash can't hang the dying
+			// process indefinitely on a dead network (Close waits forever
+			// when ShutdownTimeout is unset).
+			ShutdownTimeout: 3 * time.Second,
 		})
 		if err != nil {
 			logDebug("[telemetry] failed to create PostHog client: %v", err)
@@ -131,6 +135,18 @@ func Track(event string, properties map[string]interface{}) {
 		Event:      event,
 		Properties: props,
 	})
+}
+
+// CaptureException reports an error or panic to PostHog error tracking.
+// typ is the title shown in the UI (e.g. "panic"); value is the description.
+// NewDefaultException auto-generates the stack trace at the call site, so this
+// is best invoked directly from a recover() block. Safe to call when telemetry
+// is disabled (no-op).
+func CaptureException(typ, value string) {
+	if !enabled {
+		return
+	}
+	client.Enqueue(posthog.NewDefaultException(time.Now(), deviceID, typ, value))
 }
 
 // HashWorkflowName returns a truncated SHA256 hex digest of the workflow name.

@@ -98,3 +98,17 @@ func TestTrack_NoopWhenDisabled(t *testing.T) {
 	// Should not panic
 	Track("test_event", map[string]interface{}{"key": "value"})
 }
+
+func TestCaptureException_NoopWhenDisabled(t *testing.T) {
+	// enabled is false by default (no Init called); client is nil, so this
+	// must short-circuit without dereferencing it.
+	enabled = false
+	// Should not panic
+	CaptureException("panic", "boom")
+}
+
+func TestTrackPanic_NoopWhenDisabled(t *testing.T) {
+	enabled = false
+	// Should not panic even with a nil client.
+	TrackPanic("test.site", "boom", []byte("goroutine stack"))
+}
