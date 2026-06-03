@@ -125,7 +125,7 @@ class Vix < Formula
   desc "AI coding agent"
   homepage "https://github.com/${REPO}"
   version "${VERSION#v}"
-  license :cannot_represent
+  license "AGPL-3.0-or-later"
 
   on_macos do
     on_arm do
@@ -168,7 +168,7 @@ class Vix < Formula
   desc "AI coding agent"
   homepage "https://github.com/${REPO}"
   version "${VERSION#v}"
-  license :cannot_represent
+  license "AGPL-3.0-or-later"
 
   on_macos do
     on_arm do
