@@ -16,6 +16,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,14 +24,34 @@ import (
 	"github.com/kirby88/vix/internal/config"
 )
 
-// bedrockRateLimiter enforces the 10 req/min Bedrock quota via a sliding window.
+// bedrockRPMLimit returns the configured requests-per-minute cap for Bedrock,
+// read from VIX_BEDROCK_RPM. Returns 0 when the variable is unset or invalid,
+// which disables rate limiting (the default for production accounts).
+func bedrockRPMLimit() int {
+	v := os.Getenv("VIX_BEDROCK_RPM")
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// Sliding-window state for the optional Bedrock RPM limiter.
 var (
 	bedrockRateMu       sync.Mutex
 	bedrockRequestTimes []time.Time
 )
 
+// bedrockWaitForSlot blocks until a request slot is available under the
+// VIX_BEDROCK_RPM cap. It is a no-op when the cap is 0 (disabled).
 func bedrockWaitForSlot(ctx context.Context) error {
-	const maxRPM = 10
+	maxRPM := bedrockRPMLimit()
+	if maxRPM == 0 {
+		return nil
+	}
 	const window = time.Minute
 	for {
 		bedrockRateMu.Lock()
