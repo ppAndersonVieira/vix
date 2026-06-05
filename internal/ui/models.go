@@ -1,6 +1,10 @@
 package ui
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/get-vix/vix/internal/providers"
+)
 
 // ModelInfo describes a single LLM model available for selection in the
 // Settings tab. Spec is the prefixed identifier that gets sent on
@@ -17,62 +21,80 @@ type ProviderInfo struct {
 	DisplayName string // human-readable label shown in the UI
 }
 
-// AvailableProviders is the static set of providers shown in the left
-// column of the Settings tab Model section. Order matters — it's the
-// order users see.
-var AvailableProviders = []ProviderInfo{
-	{Name: "anthropic", DisplayName: "Anthropic"},
-	{Name: "openai", DisplayName: "OpenAI"},
-	{Name: "openrouter", DisplayName: "OpenRouter"},
-	{Name: "minimax", DisplayName: "MiniMax"},
-	{Name: "mimo", DisplayName: "Xiaomi MiMo"},
+// AvailableProviders returns the providers shown in the left column of the
+// Settings tab Model section, in registry (providers.json) order. The order is
+// what users see.
+func AvailableProviders() []ProviderInfo {
+	specs := providers.Default().All()
+	out := make([]ProviderInfo, 0, len(specs))
+	for _, p := range specs {
+		out = append(out, ProviderInfo{Name: p.ID, DisplayName: p.DisplayName})
+	}
+	return out
 }
 
-// AvailableModels is the curated catalogue of selectable models. OpenRouter
-// can route to anything; the entries here are popular routes — users with
-// other targets set them via agent frontmatter.
-var AvailableModels = []ModelInfo{
-	// Anthropic
-	{Spec: "anthropic/claude-opus-4-8", Provider: "anthropic", DisplayName: "Claude Opus 4.8"},
-	{Spec: "anthropic/claude-opus-4-7", Provider: "anthropic", DisplayName: "Claude Opus 4.7"},
-	{Spec: "anthropic/claude-opus-4-6", Provider: "anthropic", DisplayName: "Claude Opus 4.6"},
-	{Spec: "anthropic/claude-opus-4-5", Provider: "anthropic", DisplayName: "Claude Opus 4.5"},
-	{Spec: "anthropic/claude-sonnet-4-6", Provider: "anthropic", DisplayName: "Claude Sonnet 4.6"},
-	{Spec: "anthropic/claude-sonnet-4-5", Provider: "anthropic", DisplayName: "Claude Sonnet 4.5"},
-	{Spec: "anthropic/claude-haiku-4-6", Provider: "anthropic", DisplayName: "Claude Haiku 4.6"},
-	{Spec: "anthropic/claude-haiku-4-5", Provider: "anthropic", DisplayName: "Claude Haiku 4.5"},
-	{Spec: "anthropic/claude-opus-4-0", Provider: "anthropic", DisplayName: "Claude Opus 4.0"},
-	{Spec: "anthropic/claude-sonnet-4-0", Provider: "anthropic", DisplayName: "Claude Sonnet 4.0"},
-	// OpenAI
-	{Spec: "openai/gpt-5.1", Provider: "openai", DisplayName: "GPT-5.1"},
-	{Spec: "openai/gpt-5-thinking", Provider: "openai", DisplayName: "GPT-5 Thinking"},
-	{Spec: "openai/o3", Provider: "openai", DisplayName: "o3"},
-	{Spec: "openai/o4-mini", Provider: "openai", DisplayName: "o4 Mini"},
-	{Spec: "openai/gpt-4o", Provider: "openai", DisplayName: "GPT-4o"},
-	{Spec: "openai/gpt-4o-mini", Provider: "openai", DisplayName: "GPT-4o Mini"},
-	// OpenRouter — curated popular routes; arbitrary slugs go via agent frontmatter.
-	{Spec: "openrouter/anthropic/claude-opus-4-8", Provider: "openrouter", DisplayName: "Claude Opus 4.8 (via OpenRouter)"},
-	{Spec: "openrouter/anthropic/claude-sonnet-4-6", Provider: "openrouter", DisplayName: "Claude Sonnet 4.6 (via OpenRouter)"},
-	{Spec: "openrouter/openai/gpt-5.1", Provider: "openrouter", DisplayName: "GPT-5.1 (via OpenRouter)"},
-	{Spec: "openrouter/openai/o3", Provider: "openrouter", DisplayName: "o3 (via OpenRouter)"},
-	{Spec: "openrouter/google/gemini-2-flash", Provider: "openrouter", DisplayName: "Gemini 2 Flash (via OpenRouter)"},
-	// MiniMax
-	{Spec: "minimax/MiniMax-M2.7", Provider: "minimax", DisplayName: "MiniMax M2.7"},
-	{Spec: "minimax/MiniMax-M2.7-highspeed", Provider: "minimax", DisplayName: "MiniMax M2.7 (highspeed)"},
-	{Spec: "minimax/MiniMax-M2.5", Provider: "minimax", DisplayName: "MiniMax M2.5"},
-	// Xiaomi MiMo
-	{Spec: "mimo/mimo-v2.5-pro", Provider: "mimo", DisplayName: "MiMo v2.5 Pro"},
-	{Spec: "mimo/mimo-v2.5", Provider: "mimo", DisplayName: "MiMo v2.5"},
-	{Spec: "mimo/mimo-v2-flash", Provider: "mimo", DisplayName: "MiMo v2 Flash"},
+// DisplayNameForProvider returns the human-readable label for a provider name,
+// falling back to the raw name when it isn't a known provider.
+func DisplayNameForProvider(name string) string {
+	if p, ok := providers.Default().Lookup(name); ok {
+		return p.DisplayName
+	}
+	return name
 }
 
-// ModelsForProvider returns the entries in AvailableModels whose Provider
-// matches the given provider name, in declaration order. Returns nil for
-// an unknown provider.
-func ModelsForProvider(provider string) []ModelInfo {
+// AvailableModels returns the curated catalogue of selectable models, sourced
+// from the providers registry (embedded providers.json plus any ~/.vix and
+// ./.vix overlays). There is no runtime fetch of provider model lists.
+// OpenRouter can route to anything; the catalogue entries are popular routes —
+// users with other targets set them via agent frontmatter.
+func AvailableModels() []ModelInfo {
 	var out []ModelInfo
-	for _, m := range AvailableModels {
-		if m.Provider == provider {
+	for _, p := range providers.Default().All() {
+		for _, m := range p.Models {
+			out = append(out, ModelInfo{Spec: m.Spec, Provider: p.ID, DisplayName: m.DisplayName})
+		}
+	}
+	return out
+}
+
+// modelGridCols is the number of columns in the Settings tab model picker
+// grid; models are laid out row-major across this many columns. Cursor
+// navigation and the renderer both derive from it.
+const modelGridCols = 3
+
+// ModelsForProvider returns the catalogue entries for the given provider id, in
+// registry order. Returns nil for an unknown provider.
+func ModelsForProvider(provider string) []ModelInfo {
+	p, ok := providers.Default().Lookup(provider)
+	if !ok {
+		return nil
+	}
+	out := make([]ModelInfo, 0, len(p.Models))
+	for _, m := range p.Models {
+		out = append(out, ModelInfo{Spec: m.Spec, Provider: p.ID, DisplayName: m.DisplayName})
+	}
+	return out
+}
+
+// DisplayModelsForProvider returns the models shown in the Settings grid for a
+// provider. Both the renderer and the cursor navigation use this so selection
+// indices stay consistent.
+func DisplayModelsForProvider(provider string) []ModelInfo {
+	return ModelsForProvider(provider)
+}
+
+// FilterModels returns the entries whose DisplayName contains query
+// (case-insensitive). An empty query returns models unchanged. The Spec is not
+// matched: its provider prefix (e.g. "openai/") would match common query
+// letters and surface unrelated models.
+func FilterModels(models []ModelInfo, query string) []ModelInfo {
+	query = strings.TrimSpace(strings.ToLower(query))
+	if query == "" {
+		return models
+	}
+	var out []ModelInfo
+	for _, m := range models {
+		if strings.Contains(strings.ToLower(m.DisplayName), query) {
 			out = append(out, m)
 		}
 	}
@@ -98,17 +120,17 @@ func ProviderOf(spec string) string {
 // (e.g. user-installed agent uses a non-curated OpenRouter route).
 // Falls back to (0, 0) when even the prefix doesn't match a known provider.
 func locateActiveModel(spec string) (providerIdx, modelIdx int) {
-	for pi, p := range AvailableProviders {
-		models := ModelsForProvider(p.Name)
+	providerList := AvailableProviders()
+	for pi, p := range providerList {
+		models := DisplayModelsForProvider(p.Name)
 		for mi, mod := range models {
 			if mod.Spec == spec {
 				return pi, mi
 			}
 		}
 	}
-	// No exact match — fall back to the provider prefix at least.
 	specProv := ProviderOf(spec)
-	for pi, p := range AvailableProviders {
+	for pi, p := range providerList {
 		if p.Name == specProv {
 			return pi, 0
 		}

@@ -1,0 +1,182 @@
+package ui
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestParseTurnArg(t *testing.T) {
+	cases := []struct {
+		fields []string
+		want   int
+		ok     bool
+	}{
+		{[]string{"/fork", "4"}, 4, true},
+		{[]string{"/trim", "1"}, 1, true},
+		{[]string{"/copy"}, 0, false},
+		{[]string{"/fork", "0"}, 0, false},
+		{[]string{"/fork", "-3"}, 0, false},
+		{[]string{"/fork", "abc"}, 0, false},
+		{[]string{"/fork", "4", "extra"}, 4, true},
+	}
+	for _, c := range cases {
+		got, ok := parseTurnArg(c.fields)
+		if got != c.want || ok != c.ok {
+			t.Errorf("parseTurnArg(%v) = (%d, %v), want (%d, %v)", c.fields, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+func TestSlashCommandInsertText(t *testing.T) {
+	cases := []struct {
+		action string
+		want   string
+		ok     bool
+	}{
+		{"slash_fork", "/fork ", true},
+		{"slash_trim", "/trim ", true},
+		{"slash_copy", "/copy ", true},
+		{"slash_goto", "/goto ", true},
+		{"slash_clear", "", false},
+		{"slash_skills", "", false},
+		{"copy_conversation", "", false},
+	}
+	for _, c := range cases {
+		got, ok := slashCommandInsertText(c.action)
+		if got != c.want || ok != c.ok {
+			t.Errorf("slashCommandInsertText(%q) = (%q, %v), want (%q, %v)", c.action, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+func TestCountTurnSeparators(t *testing.T) {
+	msgs := []ChatMessage{
+		{Type: MsgUser, Text: "hi"},
+		{Type: MsgSystem, TurnModel: "m"},
+		{Type: MsgAssistant, Text: "a"},
+		{Type: MsgSystem, TurnModel: "m"},
+		{Type: MsgSystem, Text: "not a turn sep"}, // no TurnModel
+	}
+	if got := countTurnSeparators(msgs); got != 2 {
+		t.Errorf("countTurnSeparators = %d, want 2", got)
+	}
+	if got := countTurnSeparators(nil); got != 0 {
+		t.Errorf("countTurnSeparators(nil) = %d, want 0", got)
+	}
+}
+
+func TestTurnSepByNumber(t *testing.T) {
+	m := Model{
+		styles:     NewStyles(true),
+		mdRenderer: NewMarkdownRenderer(80, true, NewStyles(true).CodeBoxBorderStyle),
+	}
+	sess := &SessionState{
+		chatMessages: []ChatMessage{
+			{Type: MsgUser, Text: "hi", Rendered: "hi\n"},
+			{Type: MsgAssistant, Text: "a", Rendered: "a\n"},
+			{Type: MsgSystem, TurnModel: "m", Rendered: "sep0\n"}, // turn 1, idx 2
+			{Type: MsgUser, Text: "again", Rendered: "again\n"},
+			{Type: MsgSystem, TurnModel: "m", Rendered: "sep1\n"}, // turn 2, idx 4
+		},
+	}
+
+	sep, ok := m.turnSepByNumber(sess, 1)
+	if !ok || sep.TurnIdx != 0 || sep.MsgIdx != 2 {
+		t.Errorf("turnSepByNumber(1) = (%+v, %v), want TurnIdx=0 MsgIdx=2 ok=true", sep, ok)
+	}
+	sep, ok = m.turnSepByNumber(sess, 2)
+	if !ok || sep.TurnIdx != 1 || sep.MsgIdx != 4 {
+		t.Errorf("turnSepByNumber(2) = (%+v, %v), want TurnIdx=1 MsgIdx=4 ok=true", sep, ok)
+	}
+	if _, ok := m.turnSepByNumber(sess, 3); ok {
+		t.Errorf("turnSepByNumber(3) returned ok=true, want false")
+	}
+	if _, ok := m.turnSepByNumber(sess, 0); ok {
+		t.Errorf("turnSepByNumber(0) returned ok=true, want false")
+	}
+}
+
+func TestGotoTurn(t *testing.T) {
+	s := NewStyles(true)
+	m := Model{
+		width:      120,
+		height:     16,
+		styles:     s,
+		mdRenderer: NewMarkdownRenderer(116, true, s.CodeBoxBorderStyle),
+	}
+
+	var msgs []ChatMessage
+	for i := 1; i <= 8; i++ {
+		msgs = append(msgs,
+			ChatMessage{Type: MsgUser, Rendered: fmt.Sprintf("u%d\n", i)},
+			ChatMessage{Type: MsgAssistant, Rendered: fmt.Sprintf("a%d\n", i)},
+			ChatMessage{Type: MsgSystem, TurnModel: "m", Rendered: fmt.Sprintf("sep%d\n", i)},
+		)
+	}
+	sess := &SessionState{chatMessages: msgs}
+
+	// Independently recompute the rendered layout to find which logical line
+	// lands at the top of the viewport after gotoTurn.
+	innerWidth := m.effectiveChatWidth() - 4
+	allLines := strings.Split(buildRenderedChat(sess.chatMessages, s, innerWidth), "\n")
+	visualRowStart := make([]int, len(allLines)+1)
+	for i, line := range allLines {
+		visualRowStart[i+1] = visualRowStart[i] + visualRows(line, innerWidth)
+	}
+	totalVisualRows := visualRowStart[len(allLines)]
+	contentHeight := computeLayout(m.width, m.height, m.visualLineCount()).ChatHeight - 1
+
+	m.gotoTurn(sess, 2)
+
+	topVisRow := totalVisualRows - sess.chatScrollOffset - contentHeight
+	topLine := 0
+	for topLine < len(allLines) && visualRowStart[topLine+1] <= topVisRow {
+		topLine++
+	}
+	if got := allLines[topLine]; got != "u2" {
+		t.Errorf("gotoTurn(2) top line = %q, want %q (offset=%d)", got, "u2", sess.chatScrollOffset)
+	}
+	if sess.focus != FocusChat {
+		t.Errorf("gotoTurn should focus chat, got %v", sess.focus)
+	}
+
+	// Turn 1 always starts at the very top of the conversation.
+	m.gotoTurn(sess, 1)
+	if got := m.sessionMaxScrollOffset(sess); sess.chatScrollOffset != got {
+		t.Errorf("gotoTurn(1) offset = %d, want max %d", sess.chatScrollOffset, got)
+	}
+}
+
+func TestRenderTurnInfo_WideShowsActions(t *testing.T) {
+	s := NewStyles(true)
+	msg := renderTurnInfo("anthropic/claude-sonnet-4-6", 59*time.Second, 0.23, 4, 200, s)
+	plain := ansiRe.ReplaceAllString(msg.Rendered, "")
+
+	for _, want := range []string{"Turn #4", "From here:", "/fork", "/trim", "/copy", "59s", "$0.23"} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("wide separator missing %q in %q", want, plain)
+		}
+	}
+}
+
+func TestRenderTurnInfo_NarrowDropsRightZone(t *testing.T) {
+	s := NewStyles(true)
+	msg := renderTurnInfo("anthropic/claude-sonnet-4-6", 59*time.Second, 0.23, 4, 14, s)
+	plain := ansiRe.ReplaceAllString(msg.Rendered, "")
+
+	if strings.Contains(plain, "Turn #") {
+		t.Errorf("narrow separator should drop the right zone, got %q", plain)
+	}
+}
+
+func TestRenderTurnInfo_ZeroTurnNumHasNoRightZone(t *testing.T) {
+	s := NewStyles(true)
+	msg := renderTurnInfo("anthropic/claude-sonnet-4-6", 59*time.Second, 0.23, 0, 200, s)
+	plain := ansiRe.ReplaceAllString(msg.Rendered, "")
+
+	if strings.Contains(plain, "Turn #") {
+		t.Errorf("turnNum=0 should produce no right zone, got %q", plain)
+	}
+}

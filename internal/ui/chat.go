@@ -66,6 +66,7 @@ type ChatMessage struct {
 	TurnModel    string        // model name passed to renderTurnInfo
 	TurnElapsed  time.Duration // elapsed duration passed to renderTurnInfo
 	TurnCost     float64       // cost value passed to renderTurnInfo
+	TurnNum      int           // 1-based turn number passed to renderTurnInfo
 }
 
 // renderUserMessage creates a rendered user message.
@@ -402,11 +403,7 @@ func renderToolResultWithContext(name, output string, isError bool, showToolName
 	}
 
 	if detail != "" {
-		diffWidth := width
-		if md != nil {
-			diffWidth = md.width
-		}
-		rendered += renderDiffDetail(detail, s, diffWidth)
+		rendered += renderDiffDetail(detail, s, width)
 	}
 	rendered += "\n"
 
@@ -419,7 +416,6 @@ func renderToolResultWithContext(name, output string, isError bool, showToolName
 		ShowToolName: showToolName,
 	}
 }
-
 
 // renderDiffDetail formats an edit diff for side-by-side display below a tool result.
 // It parses the structured tag format emitted by FormatEditDiff:
@@ -1483,10 +1479,10 @@ func (msg ChatMessage) rerender(md *MarkdownRenderer, s Styles, width int) ChatM
 		// Reasons are not width-sensitive so we skip them on re-render.
 		return renderToolCall(msg.ToolName, msg.Text, "", [4]string{}, s)
 	case MsgToolResult:
-		return renderToolResultWithContext(msg.ToolName, msg.Text, msg.IsError, msg.ShowToolName, msg.Detail, s, md, width)
+		return renderToolResultWithContext(msg.ToolName, msg.Text, msg.IsError, msg.ShowToolName, msg.Detail, s, md, width-4)
 	case MsgSystem:
 		if msg.TurnModel != "" {
-			return renderTurnInfo(msg.TurnModel, msg.TurnElapsed, msg.TurnCost, width, s)
+			return renderTurnInfo(msg.TurnModel, msg.TurnElapsed, msg.TurnCost, msg.TurnNum, width, s)
 		}
 		return msg
 	default:
@@ -1555,47 +1551,78 @@ func turnSeparatorInfos(messages []ChatMessage, s Styles, width int) []TurnSepIn
 	return result
 }
 
-// renderForkHintLine returns the visual content (no trailing newline) for the
-// fork-hint replacement of a turn separator. Width is the same value passed
-// to renderTurnInfo (mdRenderer.width + 4).
-func renderForkHintLine(width int, s Styles) string {
-	dimStyle := lipgloss.NewStyle().Foreground(s.ColorDimGray)
-	hintStyle := lipgloss.NewStyle().Background(colorSecondary).Foreground(lipgloss.Color("0"))
-
-	prefix := "─── "
-	forkLabel := " ⎇  F · fork from here "
-	sep := " "
-	trimLabel := " ✂  T · Trim from here "
-	prefixVisual := lipgloss.Width(prefix)
-	labelsVisual := lipgloss.Width(forkLabel) + lipgloss.Width(sep) + lipgloss.Width(trimLabel)
-
-	contentWidth := width - 6 // same shrink as renderTurnInfo
-	dashCount := contentWidth - prefixVisual - labelsVisual
-	if dashCount < 1 {
-		dashCount = 1
+// countTurnSeparators returns the number of turn separators (MsgSystem with
+// TurnModel set) currently in messages. Used to assign the next 1-based turn
+// number when a turn ends.
+func countTurnSeparators(messages []ChatMessage) int {
+	n := 0
+	for _, msg := range messages {
+		if msg.Type == MsgSystem && msg.TurnModel != "" {
+			n++
+		}
 	}
-
-	return "  " + dimStyle.Render(prefix) + hintStyle.Render(forkLabel) + dimStyle.Render(sep) + hintStyle.Render(trimLabel) + dimStyle.Render(strings.Repeat("─", dashCount))
+	return n
 }
 
-// renderTurnInfo renders a turn-end info line with model, elapsed time, cost, and a dim separator.
-func renderTurnInfo(model string, elapsed time.Duration, cost float64, width int, s Styles) ChatMessage {
+// renderTurnInfo renders a turn-end separator line. The left zone keeps the
+// model, elapsed time, and cost; the right zone shows the turn number and the
+// actions available from this point. Dashes fill the gap between them. The
+// right zone degrades gracefully (and is dropped entirely) on narrow widths.
+// width is the total content width (mdRenderer.width + 4). turnNum is 1-based.
+func renderTurnInfo(model string, elapsed time.Duration, cost float64, turnNum int, width int, s Styles) ChatMessage {
 	dimStyle := lipgloss.NewStyle().Foreground(s.ColorDimGray)
 
 	secs := int(elapsed.Seconds())
 	info := fmt.Sprintf("◇ %s · %ds · $%.2f ", formatModelName(model), secs, cost)
 	infoRendered := dimStyle.Render(info)
 
-	// Fill remaining width with ─
 	// Content is inside a bordered viewport: width - 2 (border) - 2 (padding) - 2 (indent)
 	contentWidth := width - 6
-	dashCount := contentWidth - lipgloss.Width(info)
+	leftVisual := lipgloss.Width(info)
+
+	// Right-zone candidates, longest first; pick the widest that still leaves
+	// room for at least one dash of separation.
+	right := ""
+	if turnNum > 0 {
+		candidates := []string{
+			fmt.Sprintf(" Turn #%d · From here: /fork /trim /copy", turnNum),
+			fmt.Sprintf(" Turn #%d · /fork /trim /copy", turnNum),
+			fmt.Sprintf(" Turn #%d", turnNum),
+		}
+		for _, c := range candidates {
+			// Each /command badge is padded with a space on both sides, adding
+			// 2 cells per command beyond the plain text width.
+			padded := lipgloss.Width(c) + 2*strings.Count(c, "/")
+			if leftVisual+padded+1 <= contentWidth {
+				right = c
+				break
+			}
+		}
+	}
+
+	rightRendered := ""
+	rightVisual := 0
+	if right != "" {
+		cmdStyle := lipgloss.NewStyle().Background(colorSecondary).Foreground(lipgloss.Color("0")).Bold(true)
+		parts := strings.Split(right, " ")
+		for i, p := range parts {
+			if strings.HasPrefix(p, "/") {
+				parts[i] = cmdStyle.Render(" " + p + " ")
+			} else {
+				parts[i] = dimStyle.Render(p)
+			}
+		}
+		rightRendered = strings.Join(parts, " ")
+		rightVisual = lipgloss.Width(rightRendered)
+	}
+
+	dashCount := contentWidth - leftVisual - rightVisual
 	if dashCount < 1 {
 		dashCount = 1
 	}
 	dashes := dimStyle.Render(strings.Repeat("─", dashCount))
 
-	rendered := "  " + infoRendered + dashes + "\n"
+	rendered := "  " + infoRendered + dashes + rightRendered + "\n"
 	return ChatMessage{
 		Type:        MsgSystem,
 		Text:        info,
@@ -1603,5 +1630,6 @@ func renderTurnInfo(model string, elapsed time.Duration, cost float64, width int
 		TurnModel:   model,
 		TurnElapsed: elapsed,
 		TurnCost:    cost,
+		TurnNum:     turnNum,
 	}
 }

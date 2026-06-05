@@ -7,6 +7,7 @@ import (
 	"github.com/get-vix/vix/internal/config"
 	"github.com/get-vix/vix/internal/daemon"
 	"github.com/get-vix/vix/internal/protocol"
+	"github.com/get-vix/vix/internal/providers"
 )
 
 // SessionState holds all accumulated UI state for a single agent session.
@@ -48,16 +49,20 @@ type SessionState struct {
 	todos          []protocol.TodoItem
 
 	// Token accounting
-	inputTokens         int64
-	outputTokens        int64
-	cacheCreationTokens int64
-	cacheReadTokens     int64
-	lastOutputTokens    int64
+	inputTokens                  int64
+	outputTokens                 int64
+	cacheCreationTokens          int64
+	cacheReadTokens              int64
+	lastOutputTokens             int64
 	turnStartInputTokens         int64
 	turnStartOutputTokens        int64
 	turnStartCacheCreationTokens int64
 	turnStartCacheReadTokens     int64
-	elapsed time.Duration
+	elapsed                      time.Duration
+
+	// Context-window indicator
+	lastInputTokens int64 // true prompt size of the most recent turn
+	contextWindow   int64 // 0 = unknown (model not in ContextWindow table)
 
 	// Confirm / question state
 	confirmToolName    string
@@ -107,18 +112,26 @@ type SessionState struct {
 // newSessionState initialises a fresh session state ready for a new agent session.
 func newSessionState(cfg *config.Config, client *daemon.SessionClient) *SessionState {
 	s := &SessionState{
-		agentState:   StateWaitingForInput,
-		input:        newInput(),
-		thinkingAnim: NewThinkingAnim(),
+		agentState:    StateWaitingForInput,
+		input:         newInput(),
+		thinkingAnim:  NewThinkingAnim(),
 		questionPanel: NewQuestionPanel(),
-		focus:        FocusEditor,
-		client:       client,
-		modelName:    cfg.Model,
-		history:      NewHistory(cfg.Paths.Primary()),
-		showThinking: config.ShowThinking(),
+		focus:         FocusEditor,
+		client:        client,
+		modelName:     cfg.Model,
+		contextWindow: providers.Default().ContextWindow(cfg.Model),
+		history:       NewHistory(cfg.Paths.Primary()),
+		showThinking:  config.ShowThinking(),
 	}
 	if client != nil {
 		s.daemonSessionID = client.SessionID()
 	}
 	return s
+}
+
+// setModel updates the session's model spec and refreshes the resolved context
+// window used by the status-bar indicator and (daemon-side) auto-compaction.
+func (s *SessionState) setModel(spec string) {
+	s.modelName = spec
+	s.contextWindow = providers.Default().ContextWindow(spec)
 }

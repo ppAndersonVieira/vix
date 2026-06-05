@@ -15,34 +15,29 @@ import (
 type rightPanelMode int
 
 const (
-	rpModeModel    rightPanelMode = iota // model selection list
-	rpModeKeys                            // stored API key manager
-	rpModeKeyInput                        // inline key entry form
-	rpModeWorkflow                        // live workflow step progress
-	rpModeTodos                           // pending todo list
+	rpModeKeys     rightPanelMode = iota // stored API key manager
+	rpModeKeyInput                       // inline key entry form
+	rpModeWorkflow                       // live workflow step progress
+	rpModeTodos                          // pending todo list
 )
 
 // RightPanelAction is the action returned by HandleKey.
 type RightPanelAction int
 
 const (
-	rpActionNone          RightPanelAction = iota
-	rpActionClose                           // close the panel
-	rpActionModelSelected                   // payload = model API name
-	rpActionKeyDeleted                      // payload = provider name
-	rpActionKeyStored                       // payload = "provider:key"
-	rpActionNeedKey                         // payload = "provider:pendingModel"
+	rpActionNone       RightPanelAction = iota
+	rpActionClose                       // close the panel
+	rpActionKeyDeleted                  // payload = provider name
+	rpActionKeyStored                   // payload = "provider:key"
+	rpActionNeedKey                     // payload = "provider:pendingModel"
 )
 
 // RightPanel is a full-height sidebar on the right side of the screen that
-// contains either a model-selection list, an API key manager, or a key-input form.
+// contains either an API key manager or a key-input form.
 type RightPanel struct {
 	visible bool
 	mode    rightPanelMode
 	height  int
-
-	// Model selection state
-	modelSel int
 
 	// Key manager state
 	keySel int
@@ -50,7 +45,6 @@ type RightPanel struct {
 
 	// Key input state
 	keyInputProvider string
-	keyInputPending  string // model name waiting for the key
 	keyInput         textinput.Model
 }
 
@@ -65,21 +59,6 @@ func (rp *RightPanel) IsVisible() bool { return rp.visible }
 
 // Close hides the panel.
 func (rp *RightPanel) Close() { rp.visible = false }
-
-// OpenModelSelect opens the model selection list, pre-selecting the active model.
-func (rp *RightPanel) OpenModelSelect(height int, activeModel string) {
-	rp.visible = true
-	rp.mode = rpModeModel
-	rp.height = height
-	// Pre-position cursor on the currently active model
-	rp.modelSel = 0
-	for i, m := range AvailableModels {
-		if m.Spec == activeModel {
-			rp.modelSel = i
-			break
-		}
-	}
-}
 
 // OpenKeyManager opens the API key manager.
 func (rp *RightPanel) OpenKeyManager(height int) {
@@ -105,13 +84,11 @@ func (rp *RightPanel) OpenTodos(height int) {
 }
 
 // OpenKeyInput opens the inline key-entry form for the given provider.
-// pendingModel is the model the user wants to switch to once the key is saved.
-func (rp *RightPanel) OpenKeyInput(provider, pendingModel string, height int) {
+func (rp *RightPanel) OpenKeyInput(provider string, height int) {
 	rp.visible = true
 	rp.mode = rpModeKeyInput
 	rp.height = height
 	rp.keyInputProvider = provider
-	rp.keyInputPending = pendingModel
 
 	ti := textinput.New()
 	ti.Placeholder = "Paste your " + provider + " API key..."
@@ -135,28 +112,6 @@ func (rp *RightPanel) HandleKey(msg tea.KeyPressMsg) (RightPanelAction, string) 
 	}
 
 	switch rp.mode {
-	case rpModeModel:
-		switch key {
-		case "up", "k":
-			if rp.modelSel > 0 {
-				rp.modelSel--
-			}
-		case "down", "j":
-			if rp.modelSel < len(AvailableModels)-1 {
-				rp.modelSel++
-			}
-		case "enter":
-			if rp.modelSel < len(AvailableModels) {
-				m := AvailableModels[rp.modelSel]
-				apiKey, _ := config.ResolveProviderKey(m.Provider, true)
-				if apiKey != "" {
-					return rpActionModelSelected, m.Spec
-				}
-				// No key stored — need to request one
-				return rpActionNeedKey, m.Provider + ":" + m.Spec
-			}
-		}
-
 	case rpModeKeys:
 		switch key {
 		case "up", "k":
@@ -197,46 +152,14 @@ func (rp *RightPanel) HandleKey(msg tea.KeyPressMsg) (RightPanelAction, string) 
 
 // View renders the right panel as a bordered, full-height string.
 // focused controls whether the panel border uses the focus color.
-// activeModel is the currently active model API name (used to mark the selected model).
 // wfp is the workflow graph panel (used when mode is rpModeWorkflow).
 // todos is the current todo list (used in rpModeTodos and appended below steps in rpModeWorkflow).
-func (rp *RightPanel) View(height int, s Styles, focused bool, activeModel string, wfp *WorkflowGraphPanel, todos []protocol.TodoItem) string {
+func (rp *RightPanel) View(height int, s Styles, focused bool, wfp *WorkflowGraphPanel, todos []protocol.TodoItem) string {
 	innerWidth := panelWidth - 4 // border (2) + padding (2)
 
 	var lines []string
 
 	switch rp.mode {
-	case rpModeModel:
-		title := lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Width(innerWidth).Render("Select Model")
-		sep := lipgloss.NewStyle().Foreground(colorDim).Width(innerWidth).Render(strings.Repeat("─", innerWidth))
-		lines = append(lines, title, sep)
-		for i, m := range AvailableModels {
-			label := m.DisplayName
-			if m.Provider == "openai" {
-				label = "[OpenAI] " + m.DisplayName
-			}
-			isActive := m.Spec == activeModel
-			isCursor := i == rp.modelSel
-			switch {
-			case isCursor && isActive:
-				// Cursor is on the currently active model
-				line := lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Width(innerWidth).Render("▸ " + label + " ✓")
-				lines = append(lines, line)
-			case isCursor:
-				line := lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Width(innerWidth).Render("▸ " + label)
-				lines = append(lines, line)
-			case isActive:
-				// Active model without cursor focus
-				line := lipgloss.NewStyle().Foreground(colorSecondary).Width(innerWidth).Render("  " + label + " ✓")
-				lines = append(lines, line)
-			default:
-				line := lipgloss.NewStyle().Foreground(colorDim).Width(innerWidth).Render("  " + label)
-				lines = append(lines, line)
-			}
-		}
-		hint := lipgloss.NewStyle().Foreground(colorDim).Italic(true).Width(innerWidth).Render("↑/↓ navigate  Enter select  Esc close")
-		lines = append(lines, "", hint)
-
 	case rpModeKeys:
 		title := lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Width(innerWidth).Render("API Keys")
 		sep := lipgloss.NewStyle().Foreground(colorDim).Width(innerWidth).Render(strings.Repeat("─", innerWidth))

@@ -11,9 +11,32 @@ const slashMenuMaxVisible = 8
 
 // slashCommands is the fixed list of built-in slash commands shown in the menu.
 var slashCommands = []Command{
-	{Name: "copy", Description: "Copy conversation to clipboard", Action: "copy_conversation"},
+	{Name: "fork", Description: "Fork a new session from a turn (/fork N)", Action: "slash_fork"},
+	{Name: "trim", Description: "Delete all messages AFTER a turn (/trim N)", Action: "slash_trim"},
+	{Name: "copy", Description: "Copy a turn, or the whole conversation (/copy [N])", Action: "slash_copy"},
+	{Name: "goto", Description: "Scroll to a turn's start (/goto N)", Action: "slash_goto"},
 	{Name: "clear", Description: "Clear conversation history", Action: "slash_clear"},
+	{Name: "compact", Description: "Summarize older turns to free context (/compact [N])", Action: "slash_compact"},
 	{Name: "skills", Description: "List available skills", Action: "slash_skills"},
+}
+
+// slashCommandInsertText returns the input text to insert when a parameterized
+// slash command is selected from the menu (so the user can type its argument).
+// ok is false for commands that should execute immediately on select.
+func slashCommandInsertText(action string) (string, bool) {
+	switch action {
+	case "slash_fork":
+		return "/fork ", true
+	case "slash_trim":
+		return "/trim ", true
+	case "slash_copy":
+		return "/copy ", true
+	case "slash_goto":
+		return "/goto ", true
+	case "slash_compact":
+		return "/compact ", true
+	}
+	return "", false
 }
 
 // SlashMenu is a popup that lists available slash commands matching the typed /query.

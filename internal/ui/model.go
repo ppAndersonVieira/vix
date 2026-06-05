@@ -14,10 +14,11 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/atotto/clipboard"
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/ultraviolet/screen"
-	"github.com/atotto/clipboard"
 
+	"github.com/get-vix/vix/internal/auth"
 	"github.com/get-vix/vix/internal/config"
 	"github.com/get-vix/vix/internal/daemon"
 	"github.com/get-vix/vix/internal/protocol"
@@ -183,6 +184,17 @@ const (
 	StateQuitConfirm
 	StateTrimConfirm
 	StateSessionCloseConfirm
+	StateKeyDeleteConfirm
+)
+
+// modelsFocusArea identifies which area of the Models tab currently has the
+// cursor: the provider list, the authentication panel, or the model grid.
+type modelsFocusArea int
+
+const (
+	modelsFocusProviders modelsFocusArea = iota
+	modelsFocusAuth
+	modelsFocusModels
 )
 
 // pendingMsg holds a user message submitted while the agent was streaming.
@@ -210,46 +222,60 @@ type Model struct {
 
 	// Global overlay dialog state (quit confirm, session close confirm).
 	// Normal operation = StateWaitingForInput (no overlay).
-	state            AppState
-	quitSelected     int
+	state                AppState
+	quitSelected         int
 	sessionCloseIdx      int
 	sessionCloseSelected int
 
 	// Sessions tab UI
-	sessionsInput    textinput.Model
 	sessionsSelected int
 
-	// Settings tab UI
-	settingsActiveSection    int // 0=model section, 1=keys section, 2=display
-	settingsProviderSel      int // row in AvailableProviders (Model section, column 0)
-	settingsModelSel         int // row in ModelsForProvider(AvailableProviders[settingsProviderSel].Name) (Model section, column 1)
-	settingsModelColumn      int // 0 = provider column focused, 1 = model column focused
-	settingsModelPending     string // model spec awaiting an API key
-	settingsKeySel           int
-	settingsKeys             []config.ProviderKey
-	settingsKeyInputProvider string
-	settingsKeyInput         textinput.Model
-	settingsInKeyInput       bool
+	// Models tab UI
+	modelsLoggedIn         []string                             // providers with a stored credential
+	modelsAvailable        []string                             // providers without one
+	modelsStatus           map[string]config.ProviderAuthStatus // per-provider auth status (refreshed on change)
+	modelsProviderSel      int                                  // index into modelsLoggedIn ++ modelsAvailable
+	modelsFocus            modelsFocusArea                      // which Models-tab area has the cursor
+	modelsAuthRow          int                                  // authRowAPIKey | authRowOAuth (focus == auth)
+	modelsAuthBtn          int                                  // button index within the focused auth row
+	modelsModelSel         int                                  // index into the filtered model list for the selected provider
+	modelsModelScroll      int                                  // index of the top visible grid row (windowed scrolling)
+	modelsFilter           string                               // live type-to-filter query for the model grid
+	modelsModelPending     string                               // model spec awaiting a credential
+	modelsInKeyInput       bool                                 // key-entry popup open
+	modelsKeyInputProvider string                               // provider the popup is entering a key for
+	modelsKeyInput         textinput.Model                      // popup text input (holds the real value)
+	modelsLoginStatus      string                               // transient OAuth login progress/result text
+
+	// Models tab credential-delete confirmation (driven by StateKeyDeleteConfirm)
+	keyDeleteProvider string
+	keyDeleteKind     string // "api_key" | "oauth"
+	keyDeleteSelected int    // 0 = Yes, 1 = No
 
 	// Shared rendering
 	mdRenderer     *MarkdownRenderer
 	commandPalette CommandPalette
 
+	// lastChatWidth records the effective (panel-aware) chat width the markdown
+	// renderer and cached messages were last reconciled at. reconcileChatWidth
+	// uses it to detect panel/session/resize transitions and re-flow once.
+	lastChatWidth int
+
 	// Tab alert blink (Chat tab label pulses when a session needs attention)
-	tabAlertActive  bool
-	tabAlertBlinkOn bool
+	tabAlertActive   bool
+	tabAlertBlinkOn  bool
 	tabAlertBlinkGen int
 
 	// Transient status bar message (second line)
 	statusMsg StatusMessage
 
 	// Connection parameters (for reconnect / new sessions)
-	socketPath                      string
-	cwd                             string
-	authToken                       string
-	forceInit                       bool
-	enableAutomaticWritePermission  bool
-	enableAutomaticDirectoryAccess  bool
+	socketPath                     string
+	cwd                            string
+	authToken                      string
+	forceInit                      bool
+	enableAutomaticWritePermission bool
+	enableAutomaticDirectoryAccess bool
 
 	// Global settings
 	hasDarkBG      bool
@@ -272,23 +298,22 @@ func NewModel(cfg *config.Config, client *daemon.SessionClient, testMode bool, a
 	initialSession := newSessionState(cfg, client)
 
 	m := Model{
-		state:           StateWaitingForInput,
-		activeTab:       TabKindChat,
-		sessions:        []*SessionState{initialSession},
-		selectedSession: 0,
-		sessionsInput:   newSessionsInput(),
-		commandPalette:  NewCommandPalette(),
-		hasDarkBG:       true,
-		styles:          NewStyles(true),
-		mdRenderer:      NewMarkdownRenderer(80, true, NewStyles(true).CodeBoxBorderStyle),
-		cfg:             cfg,
-		socketPath:      cfg.SocketPath,
-		cwd:             cfg.CWD,
-		forceInit:       cfg.ForceInit,
-		authToken:       authToken,
+		state:                          StateWaitingForInput,
+		activeTab:                      TabKindChat,
+		sessions:                       []*SessionState{initialSession},
+		selectedSession:                0,
+		commandPalette:                 NewCommandPalette(),
+		hasDarkBG:                      true,
+		styles:                         NewStyles(true),
+		mdRenderer:                     NewMarkdownRenderer(80, true, NewStyles(true).CodeBoxBorderStyle),
+		cfg:                            cfg,
+		socketPath:                     cfg.SocketPath,
+		cwd:                            cfg.CWD,
+		forceInit:                      cfg.ForceInit,
+		authToken:                      authToken,
 		enableAutomaticWritePermission: enableWrite,
 		enableAutomaticDirectoryAccess: enableDir,
-		testMode:        testMode,
+		testMode:                       testMode,
 	}
 
 	if testMode {
@@ -313,7 +338,20 @@ func (m Model) Init() tea.Cmd {
 }
 
 // Update implements tea.Model.
+// Update is the central tea.Model update entry point. It delegates to updateInner
+// (the real message handler) and then reconciles the panel-aware chat width on
+// the resulting model, so panel open/close, session switches, and resizes all
+// re-flow width-cached content without each transition remembering to do so.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	model, cmd := m.updateInner(msg)
+	if mm, ok := model.(Model); ok {
+		mm.reconcileChatWidth()
+		return mm, cmd
+	}
+	return model, cmd
+}
+
+func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
@@ -326,7 +364,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			sess.input.SetWidth(m.width - 4)
 			sess.questionPanel.SetWidth(m.width)
 		}
-		m.sessionsInput.SetWidth(m.width - 6)
 		m.updateChatWidth()
 		return m, nil
 
@@ -349,6 +386,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// --- Quit / SessionClose / Trim dialogs intercept all keys ---
 		if m.state == StateQuitConfirm || m.state == StateSessionCloseConfirm {
 			return m.handleDialogKey(msg)
+		}
+		if m.state == StateKeyDeleteConfirm {
+			return m.handleKeyDeleteKey(msg)
 		}
 		sess := m.currentSession()
 		if sess != nil && sess.agentState == StateTrimConfirm {
@@ -391,43 +431,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.updateChatWidth()
 				sess.input.Focus()
 				sess.focus = FocusEditor
-			case rpActionModelSelected:
-				sess.modelName = payload
-				if sess.client != nil {
-					_ = sess.client.SendSetModel(payload)
-				}
-				sess.rightPanel.Close()
-				m.updateChatWidth()
-				sess.input.Focus()
-				sess.focus = FocusEditor
 			case rpActionNeedKey:
 				parts := strings.SplitN(payload, ":", 2)
 				if len(parts) == 2 {
-					sess.rightPanel.OpenKeyInput(parts[0], parts[1], m.height)
+					sess.rightPanel.OpenKeyInput(parts[0], m.height)
 				}
 			case rpActionKeyStored:
 				parts := strings.SplitN(payload, ":", 2)
 				if len(parts) == 2 {
 					provider, key := parts[0], parts[1]
 					_ = config.StoreProviderKey(provider, key)
-					pendingModel := sess.rightPanel.keyInputPending
-					if pendingModel != "" {
-						sess.modelName = pendingModel
-						if sess.client != nil {
-							_ = sess.client.SendSetModel(pendingModel)
-						}
-						sess.rightPanel.Close()
-						m.updateChatWidth()
-						sess.input.Focus()
-						sess.focus = FocusEditor
-					} else {
-						if sess.client != nil && sess.modelName != "" {
-							_ = sess.client.SendSetModel(sess.modelName)
-						}
-						sess.rightPanel.OpenKeyManager(m.height)
-						sess.focus = FocusRightPanel
-						sess.input.Blur()
+					if sess.client != nil && sess.modelName != "" {
+						_ = sess.client.SendSetModel(sess.modelName)
 					}
+					sess.rightPanel.OpenKeyManager(m.height)
+					sess.focus = FocusRightPanel
+					sess.input.Blur()
 				}
 			case rpActionKeyDeleted:
 				_ = config.DeleteProviderKey(payload)
@@ -442,7 +461,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.commandPalette.IsVisible() {
 			action, _ := m.commandPalette.Update(msg)
 			cmds = append(cmds, m.handleCommandAction(action, sess)...)
-			if !m.commandPalette.IsVisible() && sess != nil && sess.focus != FocusRightPanel && m.activeTab != TabKindSessions && m.activeTab != TabKindSettings {
+			if !m.commandPalette.IsVisible() && sess != nil && sess.focus != FocusRightPanel && m.activeTab != TabKindSessions && m.activeTab != TabKindModels && m.activeTab != TabKindSettings {
 				sess.input.Focus()
 				sess.focus = FocusEditor
 			}
@@ -534,7 +553,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				return m, tea.Batch(cmds...)
-			case "a":
+			case "t":
 				// Add a new session
 				newSess := newSessionState(m.cfg, nil)
 				newSess.input.SetWidth(m.width - 4)
@@ -545,6 +564,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.activeTab = TabKindChat
 				cmds = append(cmds, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, false, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, newSess.daemonSessionID))
 				return m, tea.Batch(cmds...)
+			case "d":
+				// Duplicate the selected session into a new one.
+				idx, ok := m.sessionsSelectedIdx()
+				if !ok {
+					return m, nil
+				}
+				srcSess := m.sessions[idx]
+				if srcSess.client == nil {
+					return m, m.emitStatusMsg("Session is still connecting; cannot duplicate", StatusMsgWarning)
+				}
+				seps := turnSeparatorInfos(srcSess.chatMessages, m.styles, m.mdRenderer.width)
+				if len(seps) == 0 {
+					return m, m.emitStatusMsg("Nothing to duplicate: no completed turns yet", StatusMsgWarning)
+				}
+				lastSep := seps[len(seps)-1]
+				nm, c := m.doDuplicate(srcSess, lastSep)
+				return nm, c
 			case "x":
 				if idx, ok := m.sessionsSelectedIdx(); ok {
 					m.sessionCloseIdx = idx
@@ -555,238 +591,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "f1":
 				return m, nil // already on Sessions tab
 			case "f2":
-				m.activeTab = TabKindChat
-				if sess := m.currentSession(); sess != nil {
-					sess.unreadCount = 0
-					cmds = append(cmds, sess.thinkingAnim.Resume())
-				}
+				cmds = append(cmds, m.switchTab(TabKindChat))
 				return m, tea.Batch(cmds...)
 			case "f3":
-				m.activeTab = TabKindSettings
-				m.settingsKeys = config.ListStoredProviderKeys()
-				m.settingsKeySel = 0
-				m.settingsInKeyInput = false
-				m.settingsActiveSection = 0
-				m.settingsModelColumn = 0
-				m.settingsProviderSel = 0
-				m.settingsModelSel = 0
-				m.settingsModelPending = ""
-				initActiveModel := m.cfg.Model
-				if initSess := m.currentSession(); initSess != nil && initSess.modelName != "" {
-					initActiveModel = initSess.modelName
-				}
-				m.settingsProviderSel, m.settingsModelSel = locateActiveModel(initActiveModel)
+				cmds = append(cmds, m.switchTab(TabKindModels))
 				return m, tea.Batch(cmds...)
-			default:
-				var cmd tea.Cmd
-				m.sessionsInput, cmd = m.sessionsInput.Update(msg)
-				if n := m.sessionsVisibleCount(); n > 0 && m.sessionsSelected >= n {
-					m.sessionsSelected = n - 1
-				}
-				return m, cmd
+			case "f4":
+				cmds = append(cmds, m.switchTab(TabKindSettings))
+				return m, tea.Batch(cmds...)
 			}
+		}
+
+		// --- Models tab key handling ---
+		if m.activeTab == TabKindModels {
+			return m.handleModelsKey(msg)
 		}
 
 		// --- Settings tab key handling ---
 		if m.activeTab == TabKindSettings {
-			if m.settingsInKeyInput {
-				switch msg.String() {
-				case "esc":
-					m.settingsInKeyInput = false
-					m.settingsModelPending = ""
-					m.settingsKeys = config.ListStoredProviderKeys()
-				case "enter":
-					val := strings.TrimSpace(m.settingsKeyInput.Value())
-					if val != "" {
-						_ = config.StoreProviderKey(m.settingsKeyInputProvider, val)
-					}
-					m.settingsInKeyInput = false
-					m.settingsKeys = config.ListStoredProviderKeys()
-					if m.settingsModelPending != "" && val != "" {
-						pending := m.settingsModelPending
-						m.settingsModelPending = ""
-						m.cfg.Model = pending
-						if pendSess := m.currentSession(); pendSess != nil {
-							pendSess.modelName = pending
-							if pendSess.client != nil {
-								_ = pendSess.client.SendSetModel(pending)
-							}
-						}
+			switch msg.String() {
+			case "enter":
+				if sess := m.currentSession(); sess != nil {
+					sess.showThinking = !sess.showThinking
+					if sess.showThinking && sess.thinkingBuf != "" {
+						sess.thinkingRendered = renderThinkingText(sess.thinkingBuf, m.styles, m.mdRenderer.width+4)
 					} else {
-						m.settingsModelPending = ""
+						sess.thinkingRendered = ""
 					}
-				default:
-					var cmd tea.Cmd
-					m.settingsKeyInput, cmd = m.settingsKeyInput.Update(msg)
-					cmds = append(cmds, cmd)
+					_ = config.SetShowThinking(sess.showThinking)
 				}
-			} else if m.settingsActiveSection == 0 {
-				// Model section — two columns: providers (column 0) and
-				// per-provider model list (column 1).
-				clampProviderSel := func() {
-					if m.settingsProviderSel < 0 {
-						m.settingsProviderSel = 0
-					}
-					if m.settingsProviderSel >= len(AvailableProviders) {
-						m.settingsProviderSel = len(AvailableProviders) - 1
-					}
-				}
-				clampModelSel := func() {
-					models := ModelsForProvider(AvailableProviders[m.settingsProviderSel].Name)
-					if m.settingsModelSel < 0 {
-						m.settingsModelSel = 0
-					}
-					if len(models) == 0 {
-						m.settingsModelSel = 0
-						return
-					}
-					if m.settingsModelSel >= len(models) {
-						m.settingsModelSel = len(models) - 1
-					}
-				}
-				switch msg.String() {
-				case "up", "k":
-					if m.settingsModelColumn == 0 {
-						if m.settingsProviderSel > 0 {
-							m.settingsProviderSel--
-							m.settingsModelSel = 0
-						}
-					} else {
-						if m.settingsModelSel > 0 {
-							m.settingsModelSel--
-						}
-					}
-				case "down", "j":
-					if m.settingsModelColumn == 0 {
-						if m.settingsProviderSel < len(AvailableProviders)-1 {
-							m.settingsProviderSel++
-							m.settingsModelSel = 0
-						}
-					} else {
-						models := ModelsForProvider(AvailableProviders[m.settingsProviderSel].Name)
-						if m.settingsModelSel < len(models)-1 {
-							m.settingsModelSel++
-						}
-					}
-				case "left", "h":
-					m.settingsModelColumn = 0
-				case "right", "l":
-					m.settingsModelColumn = 1
-					clampModelSel()
-				case "enter":
-					clampProviderSel()
-					if m.settingsModelColumn == 0 {
-						// Enter on the provider column jumps to the model column.
-						m.settingsModelColumn = 1
-						m.settingsModelSel = 0
-						clampModelSel()
-					} else {
-						models := ModelsForProvider(AvailableProviders[m.settingsProviderSel].Name)
-						if len(models) > 0 && m.settingsModelSel < len(models) {
-							mod := models[m.settingsModelSel]
-							apiKey, _ := config.ResolveProviderKey(mod.Provider, true)
-							if apiKey != "" {
-								m.cfg.Model = mod.Spec
-								if settSess := m.currentSession(); settSess != nil {
-									settSess.modelName = mod.Spec
-									if settSess.client != nil {
-										_ = settSess.client.SendSetModel(mod.Spec)
-									}
-								}
-							} else {
-								m.settingsModelPending = mod.Spec
-								ti := textinput.New()
-								ti.Placeholder = "Paste your " + mod.Provider + " API key..."
-								ti.EchoMode = textinput.EchoPassword
-								ti.Focus()
-								m.settingsKeyInput = ti
-								m.settingsKeyInputProvider = mod.Provider
-								m.settingsInKeyInput = true
-							}
-						}
-					}
-				case "tab":
-					m.settingsActiveSection = 1
-				case "f1":
-					m.activeTab = TabKindSessions
-					m.syncSessionsSelected()
-					cmds = append(cmds, m.sessionsInput.Focus())
-				case "f2":
-					m.activeTab = TabKindChat
-					if s := m.currentSession(); s != nil {
-						s.unreadCount = 0
-						cmds = append(cmds, s.thinkingAnim.Resume())
-					}
-				}
-			} else if m.settingsActiveSection == 1 {
-				// Keys section
-				switch msg.String() {
-				case "up", "k":
-					if m.settingsKeySel > 0 {
-						m.settingsKeySel--
-					}
-				case "down", "j":
-					if m.settingsKeySel < len(m.settingsKeys)-1 {
-						m.settingsKeySel++
-					}
-				case "enter":
-					if m.settingsKeySel < len(m.settingsKeys) {
-						provider := m.settingsKeys[m.settingsKeySel].Provider
-						ti := textinput.New()
-						ti.Placeholder = "Paste your " + provider + " API key..."
-						ti.EchoMode = textinput.EchoPassword
-						ti.Focus()
-						m.settingsKeyInput = ti
-						m.settingsKeyInputProvider = provider
-						m.settingsInKeyInput = true
-					}
-				case "delete", "backspace":
-					if m.settingsKeySel < len(m.settingsKeys) {
-						_ = config.DeleteProviderKey(m.settingsKeys[m.settingsKeySel].Provider)
-						m.settingsKeys = config.ListStoredProviderKeys()
-						if m.settingsKeySel >= len(m.settingsKeys) && m.settingsKeySel > 0 {
-							m.settingsKeySel--
-						}
-					}
-				case "tab":
-					m.settingsActiveSection = 2
-				case "f1":
-					m.activeTab = TabKindSessions
-					m.syncSessionsSelected()
-					cmds = append(cmds, m.sessionsInput.Focus())
-				case "f2":
-					m.activeTab = TabKindChat
-					if s := m.currentSession(); s != nil {
-						s.unreadCount = 0
-						cmds = append(cmds, s.thinkingAnim.Resume())
-					}
-				}
-			} else {
-				// Display section
-				switch msg.String() {
-				case "enter":
-					if sess := m.currentSession(); sess != nil {
-						sess.showThinking = !sess.showThinking
-						if sess.showThinking && sess.thinkingBuf != "" {
-							sess.thinkingRendered = renderThinkingText(sess.thinkingBuf, m.styles, m.mdRenderer.width+4)
-						} else {
-							sess.thinkingRendered = ""
-						}
-						_ = config.SetShowThinking(sess.showThinking)
-					}
-				case "tab":
-					m.settingsActiveSection = 0
-				case "f1":
-					m.activeTab = TabKindSessions
-					m.syncSessionsSelected()
-					cmds = append(cmds, m.sessionsInput.Focus())
-				case "f2":
-					m.activeTab = TabKindChat
-					if s := m.currentSession(); s != nil {
-						s.unreadCount = 0
-						cmds = append(cmds, s.thinkingAnim.Resume())
-					}
-				}
+			case "f1":
+				cmds = append(cmds, m.switchTab(TabKindSessions))
+			case "f2":
+				cmds = append(cmds, m.switchTab(TabKindChat))
+			case "f3":
+				cmds = append(cmds, m.switchTab(TabKindModels))
 			}
 			return m, tea.Batch(cmds...)
 		}
@@ -839,12 +678,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter", "tab":
 				action := sess.slashMenu.SelectedAction()
 				sess.slashMenu.Close()
+				// Parameterized commands are inserted into the input (with a
+				// trailing space) so the user can type the turn number, rather
+				// than executing immediately.
+				if insert, ok := slashCommandInsertText(action); ok {
+					sess.input.SetValue(insert)
+					sess.input.MoveToEnd()
+					sess.input.SetHeight(1)
+					if sess.focus != FocusRightPanel && m.activeTab != TabKindSessions && m.activeTab != TabKindModels && m.activeTab != TabKindSettings {
+						sess.input.Focus()
+						sess.focus = FocusEditor
+					}
+					return m, nil
+				}
 				sess.input.SetValue("")
 				sess.input.SetHeight(1)
 				if action != "" {
 					cmds = append(cmds, m.handleCommandAction(action, sess)...)
 				}
-				if sess.focus != FocusRightPanel && m.activeTab != TabKindSessions && m.activeTab != TabKindSettings {
+				if sess.focus != FocusRightPanel && m.activeTab != TabKindSessions && m.activeTab != TabKindModels && m.activeTab != TabKindSettings {
 					sess.input.Focus()
 					sess.focus = FocusEditor
 				}
@@ -1012,7 +864,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "f1":
 			m.activeTab = TabKindSessions
 			m.syncSessionsSelected()
-			cmds = append(cmds, m.sessionsInput.Focus())
 			return m, tea.Batch(cmds...)
 
 		case "f2":
@@ -1023,20 +874,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 
 		case "f3":
-			m.activeTab = TabKindSettings
-			m.settingsKeys = config.ListStoredProviderKeys()
-			m.settingsKeySel = 0
-			m.settingsInKeyInput = false
-			m.settingsActiveSection = 0
-			m.settingsModelColumn = 0
-			m.settingsProviderSel = 0
-			m.settingsModelSel = 0
-			m.settingsModelPending = ""
-			initActiveModel2 := m.cfg.Model
-			if initSess2 := m.currentSession(); initSess2 != nil && initSess2.modelName != "" {
-				initActiveModel2 = initSess2.modelName
-			}
-			m.settingsProviderSel, m.settingsModelSel = locateActiveModel(initActiveModel2)
+			cmds = append(cmds, m.switchTab(TabKindModels))
+			return m, tea.Batch(cmds...)
+
+		case "f4":
+			cmds = append(cmds, m.switchTab(TabKindSettings))
 			return m, tea.Batch(cmds...)
 
 		case "shift+tab":
@@ -1118,18 +960,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				sess.chatScrollOffset = m.sessionMaxScrollOffset(sess)
 			case "end", "G":
 				sess.chatScrollOffset = 0
-			case "F":
-				if sep, ok := m.sessionActiveForkSep(sess); ok {
-					return m.doFork(sep)
-				}
-			case "T":
-				if sep, ok := m.sessionActiveForkSep(sess); ok {
-					sess.trimPrevState = sess.agentState
-					sess.trimSelected = 0
-					sess.trimSep = sep
-					sess.agentState = StateTrimConfirm
-					return m, nil
-				}
 			}
 			m.clampScrollOffset(sess)
 			return m, nil
@@ -1187,6 +1017,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 
+	case loginStatusMsg:
+		// Ignore status updates for a provider the user has navigated away from,
+		// so a pending OAuth callback can't repaint a stale message.
+		if msg.provider == m.modelsSelectedProvider() {
+			m.modelsLoginStatus = msg.text
+		}
+		return m, nil
+
+	case loginDoneMsg:
+		if msg.err == nil {
+			m.refreshModelsProviders()
+		}
+		// Only surface the result if the relevant provider is still selected.
+		if msg.provider == m.modelsSelectedProvider() {
+			if msg.err != nil {
+				m.modelsLoginStatus = "Login failed: " + msg.err.Error()
+			} else {
+				m.modelsLoginStatus = "Logged in to " + msg.provider + "."
+			}
+		}
+		return m, nil
+
 	case sessionDisconnectedMsg:
 		_, sess := m.findSessionByDaemonID(msg.daemonSessionID)
 		if sess != nil {
@@ -1242,8 +1094,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.PasteMsg:
-		if m.activeTab == TabKindSettings && m.settingsInKeyInput {
-			m.settingsKeyInput, _ = m.settingsKeyInput.Update(msg)
+		if m.activeTab == TabKindModels && m.modelsInKeyInput {
+			m.modelsKeyInput, _ = m.modelsKeyInput.Update(msg)
 			return m, nil
 		}
 		sess := m.currentSession()
@@ -1328,13 +1180,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Forward unhandled messages to the active input for cursor blink
 	sess := m.currentSession()
-	if m.activeTab == TabKindSessions {
-		var cmd tea.Cmd
-		m.sessionsInput, cmd = m.sessionsInput.Update(msg)
-		if cmd != nil {
-			return m, cmd
-		}
-	} else if sess != nil {
+	if sess != nil {
 		var cmd tea.Cmd
 		sess.input, cmd = sess.input.Update(msg)
 		if cmd != nil {
@@ -1342,6 +1188,433 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// switchTab changes the active tab and performs per-tab entry side effects,
+// returning any command to run (e.g. resuming the chat thinking animation).
+func (m *Model) switchTab(k TabKind) tea.Cmd {
+	m.activeTab = k
+	switch k {
+	case TabKindSessions:
+		m.syncSessionsSelected()
+	case TabKindChat:
+		if sess := m.currentSession(); sess != nil {
+			sess.unreadCount = 0
+			return sess.thinkingAnim.Resume()
+		}
+	case TabKindModels:
+		m.enterModelsTab()
+	}
+	return nil
+}
+
+// enterModelsTab initializes Models-tab state on entry: refreshes provider
+// credential status and places the cursor on the provider that owns the active
+// model.
+func (m *Model) enterModelsTab() {
+	m.modelsFocus = modelsFocusProviders
+	m.modelsAuthRow = authRowAPIKey
+	m.modelsAuthBtn = 0
+	m.modelsModelPending = ""
+	m.modelsInKeyInput = false
+	m.modelsLoginStatus = ""
+	m.modelsFilter = ""
+	m.modelsModelScroll = 0
+	m.refreshModelsProviders()
+	active := m.activeModelSpec()
+	prov := ProviderOf(active)
+	m.modelsProviderSel = m.providerFlatIndex(prov)
+	m.modelsModelSel = modelIndexForActive(prov, active)
+	m.clampModelsScroll()
+}
+
+// refreshModelsProviders recomputes the logged-in / available provider split and
+// per-provider auth status, clamping the provider cursor to the new bounds.
+func (m *Model) refreshModelsProviders() {
+	m.modelsLoggedIn = m.modelsLoggedIn[:0]
+	m.modelsAvailable = m.modelsAvailable[:0]
+	if m.modelsStatus == nil {
+		m.modelsStatus = map[string]config.ProviderAuthStatus{}
+	}
+	for _, p := range AvailableProviders() {
+		st := config.GetProviderAuthStatus(p.Name)
+		m.modelsStatus[p.Name] = st
+		if st.APIKeyStored || st.OAuthStored {
+			m.modelsLoggedIn = append(m.modelsLoggedIn, p.Name)
+		} else {
+			m.modelsAvailable = append(m.modelsAvailable, p.Name)
+		}
+	}
+	total := len(m.modelsLoggedIn) + len(m.modelsAvailable)
+	if m.modelsProviderSel >= total {
+		m.modelsProviderSel = total - 1
+	}
+	if m.modelsProviderSel < 0 {
+		m.modelsProviderSel = 0
+	}
+}
+
+// modelsFlat returns the provider names in display order (logged in, then
+// available) — the order the provider cursor navigates.
+func (m *Model) modelsFlat() []string {
+	return append(append([]string{}, m.modelsLoggedIn...), m.modelsAvailable...)
+}
+
+// modelsSelectedProvider returns the provider name under the provider cursor.
+func (m *Model) modelsSelectedProvider() string {
+	flat := m.modelsFlat()
+	if m.modelsProviderSel >= 0 && m.modelsProviderSel < len(flat) {
+		return flat[m.modelsProviderSel]
+	}
+	return ""
+}
+
+// providerFlatIndex returns the index of provider in the flat provider list, or
+// 0 when not found.
+func (m *Model) providerFlatIndex(provider string) int {
+	for i, p := range m.modelsFlat() {
+		if p == provider {
+			return i
+		}
+	}
+	return 0
+}
+
+// modelIndexForActive returns the grid index of spec within a provider's models,
+// or 0 when absent.
+func modelIndexForActive(provider, spec string) int {
+	for i, mod := range DisplayModelsForProvider(provider) {
+		if mod.Spec == spec {
+			return i
+		}
+	}
+	return 0
+}
+
+// activeModelSpec returns the model spec currently in effect for the active
+// session, falling back to the configured default.
+func (m *Model) activeModelSpec() string {
+	spec := m.cfg.Model
+	if sess := m.currentSession(); sess != nil && sess.modelName != "" {
+		spec = sess.modelName
+	}
+	return spec
+}
+
+// applyModelSelection makes spec the default chat model and pushes it to the
+// active session (and daemon) when connected.
+func (m *Model) applyModelSelection(spec string) {
+	m.cfg.Model = spec
+	if sess := m.currentSession(); sess != nil {
+		sess.setModel(spec)
+		if sess.client != nil {
+			_ = sess.client.SendSetModel(spec)
+		}
+	}
+}
+
+// openModelsKeyInput opens the credential-entry popup for a provider.
+func (m *Model) openModelsKeyInput(provider string) {
+	ti := textinput.New()
+	ti.Placeholder = "Paste your " + provider + " API key..."
+	ti.Focus()
+	m.modelsKeyInput = ti
+	m.modelsKeyInputProvider = provider
+	m.modelsInKeyInput = true
+}
+
+// clampModelsAuth keeps the focused auth button index within range after the
+// button set changes (e.g. a credential was added/removed or made default).
+func (m *Model) clampModelsAuth() {
+	st := m.modelsStatus[m.modelsSelectedProvider()]
+	btns := authButtonsFor(st, m.modelsAuthRow)
+	if m.modelsAuthBtn >= len(btns) {
+		m.modelsAuthBtn = len(btns) - 1
+	}
+	if m.modelsAuthBtn < 0 {
+		m.modelsAuthBtn = 0
+	}
+}
+
+// handleModelsKey handles all key input for the Models tab.
+func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
+
+	// Credential-entry popup intercepts all keys while open.
+	if m.modelsInKeyInput {
+		switch msg.String() {
+		case "esc":
+			m.modelsInKeyInput = false
+			m.modelsModelPending = ""
+		case "enter":
+			val := strings.TrimSpace(m.modelsKeyInput.Value())
+			if val != "" {
+				_ = config.StoreProviderKey(m.modelsKeyInputProvider, val)
+			}
+			m.modelsInKeyInput = false
+			m.refreshModelsProviders()
+			if m.modelsModelPending != "" && val != "" {
+				m.applyModelSelection(m.modelsModelPending)
+			}
+			m.modelsModelPending = ""
+		default:
+			var cmd tea.Cmd
+			m.modelsKeyInput, cmd = m.modelsKeyInput.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
+	}
+
+	// F-keys switch tabs regardless of focus.
+	switch msg.String() {
+	case "f1":
+		cmds = append(cmds, m.switchTab(TabKindSessions))
+		return m, tea.Batch(cmds...)
+	case "f2":
+		cmds = append(cmds, m.switchTab(TabKindChat))
+		return m, tea.Batch(cmds...)
+	case "f3":
+		return m, nil // already on Models tab
+	case "f4":
+		cmds = append(cmds, m.switchTab(TabKindSettings))
+		return m, tea.Batch(cmds...)
+	}
+
+	switch m.modelsFocus {
+	case modelsFocusProviders:
+		switch msg.String() {
+		case "up", "k":
+			if m.modelsProviderSel > 0 {
+				m.modelsProviderSel--
+				m.modelsModelSel = 0
+				m.modelsModelScroll = 0
+				m.modelsFilter = ""
+				m.modelsAuthRow = authRowAPIKey
+				m.modelsAuthBtn = 0
+				m.modelsLoginStatus = ""
+			}
+		case "down", "j":
+			if m.modelsProviderSel < len(m.modelsFlat())-1 {
+				m.modelsProviderSel++
+				m.modelsModelSel = 0
+				m.modelsModelScroll = 0
+				m.modelsFilter = ""
+				m.modelsAuthRow = authRowAPIKey
+				m.modelsAuthBtn = 0
+				m.modelsLoginStatus = ""
+			}
+		case "right", "l", "enter", "tab":
+			m.modelsFocus = modelsFocusAuth
+			m.modelsAuthRow = authRowAPIKey
+			m.modelsAuthBtn = 0
+		}
+	case modelsFocusAuth:
+		st := m.modelsStatus[m.modelsSelectedProvider()]
+		switch msg.String() {
+		case "left", "h":
+			if m.modelsAuthBtn > 0 {
+				m.modelsAuthBtn--
+			} else {
+				m.modelsFocus = modelsFocusProviders
+			}
+		case "right", "l":
+			if btns := authButtonsFor(st, m.modelsAuthRow); m.modelsAuthBtn < len(btns)-1 {
+				m.modelsAuthBtn++
+			}
+		case "up", "k":
+			if m.modelsAuthRow == authRowOAuth {
+				m.modelsAuthRow = authRowAPIKey
+				m.modelsAuthBtn = 0
+			} else {
+				m.modelsFocus = modelsFocusProviders
+			}
+		case "down", "j":
+			if m.modelsAuthRow == authRowAPIKey && len(authButtonsFor(st, authRowOAuth)) > 0 {
+				m.modelsAuthRow = authRowOAuth
+				m.modelsAuthBtn = 0
+			} else {
+				m.modelsFocus = modelsFocusModels
+				m.modelsModelSel = 0
+			}
+		case "tab":
+			m.modelsFocus = modelsFocusModels
+			m.modelsModelSel = 0
+		case "enter":
+			return m.activateAuthButton()
+		}
+	case modelsFocusModels:
+		models := FilterModels(DisplayModelsForProvider(m.modelsSelectedProvider()), m.modelsFilter)
+		switch msg.String() {
+		case "up":
+			if m.modelsModelSel >= modelGridCols {
+				m.modelsModelSel -= modelGridCols
+			} else {
+				m.modelsFocus = modelsFocusAuth
+			}
+		case "down":
+			if m.modelsModelSel+modelGridCols < len(models) {
+				m.modelsModelSel += modelGridCols
+			}
+		case "left":
+			if m.modelsModelSel%modelGridCols > 0 {
+				m.modelsModelSel--
+			}
+		case "right":
+			if m.modelsModelSel%modelGridCols < modelGridCols-1 && m.modelsModelSel+1 < len(models) {
+				m.modelsModelSel++
+			}
+		case "tab":
+			m.modelsFocus = modelsFocusProviders
+		case "enter":
+			if m.modelsModelSel >= 0 && m.modelsModelSel < len(models) {
+				return m.selectModel(models[m.modelsModelSel])
+			}
+		case "esc":
+			if m.modelsFilter != "" {
+				m.modelsFilter = ""
+				m.modelsModelSel = 0
+				m.modelsModelScroll = 0
+			}
+		case "backspace":
+			if m.modelsFilter != "" {
+				r := []rune(m.modelsFilter)
+				m.modelsFilter = string(r[:len(r)-1])
+				m.modelsModelSel = 0
+				m.modelsModelScroll = 0
+			}
+		default:
+			// Type-to-filter: printable text narrows the grid. msg.Text is empty
+			// for non-text keys (arrows, modifiers), so navigation is unaffected.
+			if t := msg.Text; t != "" {
+				m.modelsFilter += t
+				m.modelsModelSel = 0
+				m.modelsModelScroll = 0
+			}
+		}
+		m.clampModelsScroll()
+	}
+	return m, tea.Batch(cmds...)
+}
+
+// clampModelsScroll keeps the model-grid scroll offset so the selected model
+// stays within the visible window. It mirrors the renderer's row math via the
+// shared modelsGridRows helper.
+func (m *Model) clampModelsScroll() {
+	st := m.modelsStatus[m.modelsSelectedProvider()]
+	gridRows := modelsGridRows(m.modelsViewportHeight(), st, m.modelsLoginStatus)
+	selRow := m.modelsModelSel / modelGridCols
+	if selRow < m.modelsModelScroll {
+		m.modelsModelScroll = selRow
+	}
+	if selRow >= m.modelsModelScroll+gridRows {
+		m.modelsModelScroll = selRow - gridRows + 1
+	}
+	if m.modelsModelScroll < 0 {
+		m.modelsModelScroll = 0
+	}
+}
+
+// modelsViewportHeight returns the Models-tab viewport height, matching the
+// value View() passes to renderModelsView (full height minus the tab bar and
+// status bar).
+func (m Model) modelsViewportHeight() int {
+	h := m.height - 5 // tab bar (3) + status bar (2)
+	if h < 1 {
+		h = 1
+	}
+	return h
+}
+
+// selectModel applies the chosen model when its provider has a resolvable
+// credential, otherwise opens the key popup and remembers the pending model.
+func (m Model) selectModel(mod ModelInfo) (tea.Model, tea.Cmd) {
+	if key, _ := config.ResolveProviderKey(mod.Provider); key != "" {
+		m.applyModelSelection(mod.Spec)
+		return m, nil
+	}
+	m.modelsModelPending = mod.Spec
+	m.openModelsKeyInput(mod.Provider)
+	return m, nil
+}
+
+// activateAuthButton runs the action of the focused authentication button.
+func (m Model) activateAuthButton() (tea.Model, tea.Cmd) {
+	provider := m.modelsSelectedProvider()
+	if provider == "" {
+		return m, nil
+	}
+	st := m.modelsStatus[provider]
+	btns := authButtonsFor(st, m.modelsAuthRow)
+	if m.modelsAuthBtn < 0 || m.modelsAuthBtn >= len(btns) {
+		return m, nil
+	}
+	switch btns[m.modelsAuthBtn].id {
+	case "set_key":
+		m.openModelsKeyInput(provider)
+	case "del_key":
+		m.keyDeleteProvider = provider
+		m.keyDeleteKind = "api_key"
+		m.keyDeleteSelected = 1
+		m.state = StateKeyDeleteConfirm
+	case "default_key":
+		_ = config.SetProviderAuthDefault(provider, config.AuthDefaultAPIKey)
+		m.refreshModelsProviders()
+		m.clampModelsAuth()
+	case "set_token":
+		if ProviderSupportsLogin(provider) {
+			m.modelsLoginStatus = "Starting " + provider + " login…"
+			startProviderLogin(provider)
+		}
+	case "del_token":
+		m.keyDeleteProvider = provider
+		m.keyDeleteKind = "oauth"
+		m.keyDeleteSelected = 1
+		m.state = StateKeyDeleteConfirm
+	case "default_token":
+		_ = config.SetProviderAuthDefault(provider, config.AuthDefaultOAuth)
+		m.refreshModelsProviders()
+		m.clampModelsAuth()
+	}
+	return m, nil
+}
+
+// handleKeyDeleteKey handles keys for the credential-deletion confirm dialog.
+func (m Model) handleKeyDeleteKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "left", "right", "tab":
+		if m.keyDeleteSelected == 0 {
+			m.keyDeleteSelected = 1
+		} else {
+			m.keyDeleteSelected = 0
+		}
+	case "enter":
+		if m.keyDeleteSelected == 0 {
+			m.doKeyDelete()
+		}
+		m.state = StateWaitingForInput
+	case "y", "Y":
+		m.doKeyDelete()
+		m.state = StateWaitingForInput
+	case "n", "N", "esc":
+		m.state = StateWaitingForInput
+	}
+	return m, nil
+}
+
+// doKeyDelete removes the credential targeted by the confirm dialog and refreshes
+// the provider status.
+func (m *Model) doKeyDelete() {
+	switch m.keyDeleteKind {
+	case "api_key":
+		_ = config.DeleteProviderKey(m.keyDeleteProvider)
+	case "oauth":
+		if loginID, ok := oauthLoginID(m.keyDeleteProvider); ok {
+			_ = auth.DefaultStorage().Remove(loginID)
+		}
+		_ = config.ClearProviderAuthDefault(m.keyDeleteProvider)
+	}
+	m.refreshModelsProviders()
+	m.clampModelsAuth()
 }
 
 // handleDialogKey handles keys for the global quit/session-close dialogs.
@@ -1501,6 +1774,13 @@ func (m Model) handleEnter(sess *SessionState) (tea.Model, tea.Cmd) {
 		if text == "" && sess.attachmentPanel.Count() == 0 {
 			return m, nil
 		}
+
+		// Client-side slash commands (/fork, /trim, /copy) act on the local
+		// conversation and are never sent to the daemon.
+		if handled, model, cmd := m.tryLocalCommand(sess); handled {
+			return model, cmd
+		}
+
 		if text != "" {
 			sess.history.Save(text)
 		}
@@ -1551,7 +1831,7 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 		json.Unmarshal(data, &state)
 		sess.initState = protocol.InitState(state.State)
 		if state.Model != "" {
-			sess.modelName = state.Model
+			sess.setModel(state.Model)
 		}
 
 	case "event.workflows_available":
@@ -1600,6 +1880,7 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 			sess.lastOutputTokens = done.OutputTokens
 			sess.elapsed = time.Duration(done.ElapsedMs) * time.Millisecond
 		}
+		sess.lastInputTokens = done.InputTokens + done.CacheReadTokens + done.CacheCreationTokens
 
 	case "event.tool_call":
 		m.flushSessionBuf(sess)
@@ -1786,7 +2067,8 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 		turnCacheCreation := sess.cacheCreationTokens - sess.turnStartCacheCreationTokens
 		turnCacheRead := sess.cacheReadTokens - sess.turnStartCacheReadTokens
 		cost := protocol.CalculateCost(sess.modelName, turnInput, turnOutput, turnCacheCreation, turnCacheRead)
-		sess.chatMessages = append(sess.chatMessages, renderTurnInfo(sess.modelName, sess.elapsed, cost, m.mdRenderer.width+4, m.styles))
+		turnNum := countTurnSeparators(sess.chatMessages) + 1
+		sess.chatMessages = append(sess.chatMessages, renderTurnInfo(sess.modelName, sess.elapsed, cost, turnNum, m.mdRenderer.width+4, m.styles))
 		sess.turnStartInputTokens = sess.inputTokens
 		sess.turnStartOutputTokens = sess.outputTokens
 		sess.turnStartCacheCreationTokens = sess.cacheCreationTokens
@@ -1822,7 +2104,21 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 		sess.turnStartCacheCreationTokens = 0
 		sess.turnStartCacheReadTokens = 0
 		sess.elapsed = 0
+		sess.lastInputTokens = 0
 		sess.chatMessages = append(sess.chatMessages, renderSystemMessage("Conversation cleared.", m.styles))
+
+	case "event.compacted":
+		data := marshalData(event.Data)
+		var c protocol.EventCompacted
+		json.Unmarshal(data, &c)
+		m.flushSessionBuf(sess)
+		sess.lastInputTokens = 0
+		verb := "Compacted"
+		if c.Auto {
+			verb = "Auto-compacted"
+		}
+		label := fmt.Sprintf("%s %d earlier turn(s) into a summary.", verb, c.SummarizedTurns)
+		sess.chatMessages = append(sess.chatMessages, renderSystemMessage(label, m.styles))
 
 	case "event.retry":
 		data := marshalData(event.Data)
@@ -1870,10 +2166,7 @@ func (m Model) View() tea.View {
 	layout := computeLayout(m.width, m.height, inputLines, panelHeights...)
 
 	if sess != nil && sess.rightPanel.IsVisible() {
-		layout.ChatWidth = m.width - sess.rightPanel.PanelWidth()
-		if layout.ChatWidth < 10 {
-			layout.ChatWidth = 10
-		}
+		layout.ChatWidth = m.effectiveChatWidth()
 	}
 
 	canvas := uv.NewScreenBuffer(m.width, m.height)
@@ -1882,9 +2175,9 @@ func (m Model) View() tea.View {
 	y := 0
 
 	// Tab bar
-	viewportFocused := m.activeTab == TabKindSessions || m.activeTab == TabKindSettings || (sess != nil && sess.focus == FocusChat)
+	viewportFocused := m.activeTab == TabKindSessions || m.activeTab == TabKindModels || m.activeTab == TabKindSettings || (sess != nil && sess.focus == FocusChat)
 	tabBarWidth := layout.ChatWidth
-	if m.activeTab == TabKindSessions || m.activeTab == TabKindSettings {
+	if m.activeTab == TabKindSessions || m.activeTab == TabKindModels || m.activeTab == TabKindSettings {
 		tabBarWidth = m.width
 	}
 	tabBar := renderTabBar(m.activeTab, tabBarWidth, m.styles, viewportFocused, m.tabAlertBlinkOn)
@@ -1894,15 +2187,16 @@ func (m Model) View() tea.View {
 	switch m.activeTab {
 	case TabKindSessions:
 		sessionsHeight := m.height - layout.TabBarHeight - layout.StatusBarHeight
-		sv := renderSessionsView(m.sessions, m.width, sessionsHeight, m.styles, m.sessionsInput.Value(), m.sessionsInput.View(), m.sessionsSelected)
+		sv := renderSessionsView(m.sessions, m.width, sessionsHeight, m.styles, m.sessionsSelected)
 		uv.NewStyledString(sv).Draw(canvas, image.Rect(0, y, m.width, y+sessionsHeight))
 		y += sessionsHeight
 
 	case TabKindChat:
 		// Chat content
+		innerWidth := layout.ChatWidth - 4
 		var chatContent string
 		if sess != nil {
-			chatContent = buildRenderedChat(sess.chatMessages, m.styles, m.mdRenderer.width)
+			chatContent = buildRenderedChat(sess.chatMessages, m.styles, innerWidth)
 			if sess.showThinking && sess.thinkingRendered != "" {
 				chatContent += sess.thinkingRendered + "\n"
 			}
@@ -1913,11 +2207,10 @@ func (m Model) View() tea.View {
 			}
 		}
 		if chatContent == "" && !m.testMode {
-			chatContent = renderWelcomeInline(m.mdRenderer.width, layout.ChatHeight-1, m.styles)
+			chatContent = renderWelcomeInline(innerWidth, layout.ChatHeight-1, m.styles)
 		}
 
 		contentHeight := layout.ChatHeight - 1
-		innerWidth := m.mdRenderer.width
 		allLines := strings.Split(chatContent, "\n")
 
 		visualRowStart := make([]int, len(allLines)+1)
@@ -1955,15 +2248,6 @@ func (m Model) View() tea.View {
 
 		chatLines := allLines[startLogical:endLogical]
 
-		if sess != nil && sess.chatScrollOffset > 0 && sess.client != nil {
-			for _, sep := range turnSeparatorInfos(sess.chatMessages, m.styles, m.mdRenderer.width) {
-				if sep.LineIdx >= startLogical && sep.LineIdx < endLogical {
-					chatLines[sep.LineIdx-startLogical] = renderForkHintLine(m.mdRenderer.width+4, m.styles)
-					break
-				}
-			}
-		}
-
 		var chatBorderStyle lipgloss.Style
 		if sess != nil && sess.focus == FocusChat {
 			chatBorderStyle = m.styles.ViewportFocusedStyle
@@ -1979,7 +2263,7 @@ func (m Model) View() tea.View {
 		// Right panel
 		if sess != nil && sess.rightPanel.IsVisible() {
 			rpHeight := layout.ChatHeight + 1
-			rpView := sess.rightPanel.View(rpHeight, m.styles, sess.focus == FocusRightPanel, sess.modelName, &sess.workflowGraphPanel, sess.todos)
+			rpView := sess.rightPanel.View(rpHeight, m.styles, sess.focus == FocusRightPanel, &sess.workflowGraphPanel, sess.todos)
 			rpX := m.width - sess.rightPanel.PanelWidth()
 			uv.NewStyledString(rpView).Draw(canvas, image.Rect(rpX, y-1, m.width, y-1+rpHeight))
 		}
@@ -2018,17 +2302,23 @@ func (m Model) View() tea.View {
 		uv.NewStyledString(inputSection).Draw(canvas, image.Rect(0, y, m.width, y+layout.InputHeight))
 		y += layout.InputHeight
 
+	case TabKindModels:
+		modelsHeight := m.height - layout.TabBarHeight - layout.StatusBarHeight
+		mv := renderModelsView(m.width, modelsHeight, m.styles,
+			m.modelsLoggedIn, m.modelsAvailable, m.modelsStatus,
+			m.modelsProviderSel, m.modelsFocus,
+			m.modelsAuthRow, m.modelsAuthBtn, m.modelsModelSel, m.modelsModelScroll,
+			m.modelsFilter, m.activeModelSpec(), m.modelsLoginStatus)
+		uv.NewStyledString(mv).Draw(canvas, image.Rect(0, y, m.width, y+modelsHeight))
+		y += modelsHeight
+
 	case TabKindSettings:
 		settingsHeight := m.height - layout.TabBarHeight - layout.StatusBarHeight
-		settingsActiveModel := m.cfg.Model
 		settingsShowThinking := config.ShowThinking()
 		if settSess := m.currentSession(); settSess != nil {
-			if settSess.modelName != "" {
-				settingsActiveModel = settSess.modelName
-			}
 			settingsShowThinking = settSess.showThinking
 		}
-		sv := renderSettingsView(m.width, settingsHeight, m.styles, m.settingsActiveSection, m.settingsProviderSel, m.settingsModelSel, m.settingsModelColumn, settingsActiveModel, m.settingsKeys, m.settingsKeySel, m.settingsInKeyInput, m.settingsKeyInputProvider, m.settingsKeyInput.View(), settingsShowThinking)
+		sv := renderSettingsView(m.width, settingsHeight, m.styles, settingsShowThinking)
 		uv.NewStyledString(sv).Draw(canvas, image.Rect(0, y, m.width, y+settingsHeight))
 		y += settingsHeight
 	}
@@ -2045,7 +2335,14 @@ func (m Model) View() tea.View {
 			reconnecting = true
 		}
 	}
-	statusBar := renderStatusBar(m.width, connected, reconnecting, m.statusMsg, m.styles)
+	statusFocus := FocusEditor
+	var statusInputTokens, statusContextWindow int64
+	if sess != nil {
+		statusFocus = sess.focus
+		statusInputTokens = sess.lastInputTokens
+		statusContextWindow = sess.contextWindow
+	}
+	statusBar := renderStatusBar(m.width, connected, reconnecting, m.statusMsg, m.styles, m.activeTab, statusFocus, statusInputTokens, statusContextWindow)
 	uv.NewStyledString(statusBar).Draw(canvas, image.Rect(0, y, m.width, m.height))
 
 	// Command palette overlay
@@ -2086,6 +2383,22 @@ func (m Model) View() tea.View {
 		uv.NewStyledString(overlay).Draw(canvas, center)
 	}
 
+	// Credential-entry popup overlay (Models tab)
+	if m.modelsInKeyInput {
+		overlay := renderKeyInputDialog(m.width, m.height, m.styles, DisplayNameForProvider(m.modelsKeyInputProvider), maskSecret(m.modelsKeyInput.Value()))
+		w, h := lipgloss.Size(overlay)
+		center := centerRect(canvas.Bounds(), w, h)
+		uv.NewStyledString(overlay).Draw(canvas, center)
+	}
+
+	// Credential-delete confirm overlay (Models tab)
+	if m.state == StateKeyDeleteConfirm {
+		overlay := renderKeyDeleteDialog(m.width, m.height, m.styles, DisplayNameForProvider(m.keyDeleteProvider), m.keyDeleteKind, m.keyDeleteSelected)
+		w, h := lipgloss.Size(overlay)
+		center := centerRect(canvas.Bounds(), w, h)
+		uv.NewStyledString(overlay).Draw(canvas, center)
+	}
+
 	// File completer overlay
 	if sess != nil && sess.fileCompleter.IsVisible() {
 		popupWidth := 40
@@ -2106,7 +2419,8 @@ func (m Model) View() tea.View {
 
 	// Slash menu overlay
 	if sess != nil && sess.slashMenu.IsVisible() {
-		overlay := sess.slashMenu.View(60, 8, m.styles)
+		popupWidth := 70
+		overlay := sess.slashMenu.View(popupWidth, 8, m.styles)
 		if overlay != "" {
 			_, h := lipgloss.Size(overlay)
 			inputTop := m.height - layout.StatusBarHeight - layout.InputHeight
@@ -2114,7 +2428,7 @@ func (m Model) View() tea.View {
 			if popupY < 0 {
 				popupY = 0
 			}
-			uv.NewStyledString(overlay).Draw(canvas, image.Rect(2, popupY, 2+60, popupY+h))
+			uv.NewStyledString(overlay).Draw(canvas, image.Rect(2, popupY, 2+popupWidth, popupY+h))
 		}
 	}
 
@@ -2131,13 +2445,6 @@ func (m Model) View() tea.View {
 func (m *Model) handleCommandAction(action string, sess *SessionState) []tea.Cmd {
 	var cmds []tea.Cmd
 	switch action {
-	case "change_model":
-		if sess != nil {
-			sess.rightPanel.OpenModelSelect(m.height, sess.modelName)
-			m.updateChatWidth()
-			sess.focus = FocusRightPanel
-			sess.input.Blur()
-		}
 	case "manage_keys":
 		if sess != nil {
 			sess.rightPanel.OpenKeyManager(m.height)
@@ -2219,30 +2526,13 @@ func (m *Model) handleCommandAction(action string, sess *SessionState) []tea.Cmd
 			if i, err := strconv.Atoi(idxStr); err == nil {
 				switch TabKind(i) {
 				case TabKindSessions:
-					m.activeTab = TabKindSessions
-					m.syncSessionsSelected()
-					cmds = append(cmds, m.sessionsInput.Focus())
+					cmds = append(cmds, m.switchTab(TabKindSessions))
 				case TabKindChat:
-					m.activeTab = TabKindChat
-					if sess != nil {
-						sess.unreadCount = 0
-						cmds = append(cmds, sess.thinkingAnim.Resume())
-					}
+					cmds = append(cmds, m.switchTab(TabKindChat))
+				case TabKindModels:
+					cmds = append(cmds, m.switchTab(TabKindModels))
 				case TabKindSettings:
-					m.activeTab = TabKindSettings
-					m.settingsKeys = config.ListStoredProviderKeys()
-					m.settingsKeySel = 0
-					m.settingsInKeyInput = false
-					m.settingsActiveSection = 0
-					m.settingsModelColumn = 0
-					m.settingsProviderSel = 0
-					m.settingsModelSel = 0
-					m.settingsModelPending = ""
-					initActiveModel3 := m.cfg.Model
-					if initSess3 := m.currentSession(); initSess3 != nil && initSess3.modelName != "" {
-						initActiveModel3 = initSess3.modelName
-					}
-					m.settingsProviderSel, m.settingsModelSel = locateActiveModel(initActiveModel3)
+					cmds = append(cmds, m.switchTab(TabKindSettings))
 				}
 			}
 		}
@@ -2296,7 +2586,15 @@ func (m *Model) visualLineCount() int {
 func (m *Model) sessionMaxScrollOffset(sess *SessionState) int {
 	layout := computeLayout(m.width, m.height, m.visualLineCount())
 	contentHeight := layout.ChatHeight - 1
-	chatContent := buildRenderedChat(sess.chatMessages, m.styles, m.mdRenderer.width)
+	chatWidth := layout.ChatWidth
+	if sess.rightPanel.IsVisible() {
+		chatWidth = m.width - sess.rightPanel.PanelWidth()
+		if chatWidth < 10 {
+			chatWidth = 10
+		}
+	}
+	innerWidth := chatWidth - 4
+	chatContent := buildRenderedChat(sess.chatMessages, m.styles, innerWidth)
 	if sess.showThinking && sess.thinkingRendered != "" {
 		chatContent += sess.thinkingRendered + "\n"
 	}
@@ -2304,9 +2602,8 @@ func (m *Model) sessionMaxScrollOffset(sess *SessionState) int {
 		chatContent += sess.assistantRendered
 	}
 	if chatContent == "" && !m.testMode {
-		chatContent = renderWelcomeInline(m.mdRenderer.width, contentHeight, m.styles)
+		chatContent = renderWelcomeInline(innerWidth, contentHeight, m.styles)
 	}
-	innerWidth := m.mdRenderer.width
 	totalVisualRows := 0
 	for _, line := range strings.Split(chatContent, "\n") {
 		totalVisualRows += visualRows(line, innerWidth)
@@ -2328,54 +2625,200 @@ func (m *Model) clampScrollOffset(sess *SessionState) {
 	}
 }
 
-// sessionActiveForkSep returns the topmost visible turn separator when scrolled up.
-func (m *Model) sessionActiveForkSep(sess *SessionState) (TurnSepInfo, bool) {
-	if sess.chatScrollOffset == 0 || sess.client == nil {
-		return TurnSepInfo{}, false
+// turnSepByNumber returns the separator info for the given 1-based turn number.
+func (m *Model) turnSepByNumber(sess *SessionState, turnNum int) (TurnSepInfo, bool) {
+	for _, s := range turnSeparatorInfos(sess.chatMessages, m.styles, m.mdRenderer.width) {
+		if s.TurnIdx == turnNum-1 {
+			return s, true
+		}
 	}
-	layout := computeLayout(m.width, m.height, m.visualLineCount())
-	contentHeight := layout.ChatHeight - 1
-	chatContent := buildRenderedChat(sess.chatMessages, m.styles, m.mdRenderer.width)
+	return TurnSepInfo{}, false
+}
+
+// parseTurnArg extracts a positive turn number from the second field of a
+// command, e.g. ["/fork", "4"] -> 4.
+func parseTurnArg(fields []string) (int, bool) {
+	if len(fields) < 2 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(fields[1])
+	if err != nil || n < 1 {
+		return 0, false
+	}
+	return n, true
+}
+
+// appendCommandError appends a system message describing a command error.
+func (m *Model) appendCommandError(sess *SessionState, text string) {
+	sess.input.Reset()
+	sess.input.SetHeight(1)
+	sess.chatMessages = append(sess.chatMessages, renderSystemMessage(text, m.styles))
+	sess.chatScrollOffset = 0
+}
+
+// tryLocalCommand intercepts client-side slash commands (/fork, /trim, /copy)
+// typed into the input. When the input is a recognized local command it is
+// consumed (never sent to the daemon) and handled is true; the returned
+// model/cmd should then be used as handleEnter's result.
+func (m Model) tryLocalCommand(sess *SessionState) (handled bool, model tea.Model, cmd tea.Cmd) {
+	text := strings.TrimSpace(sess.input.Value())
+	if !strings.HasPrefix(text, "/") {
+		return false, m, nil
+	}
+	fields := strings.Fields(text)
+	switch fields[0] {
+	case "/fork":
+		n, ok := parseTurnArg(fields)
+		if !ok {
+			m.appendCommandError(sess, "Usage: /fork N  (N = turn number)")
+			return true, m, nil
+		}
+		sep, ok := m.turnSepByNumber(sess, n)
+		if !ok {
+			m.appendCommandError(sess, fmt.Sprintf("No such turn: %d", n))
+			return true, m, nil
+		}
+		sess.input.Reset()
+		sess.input.SetHeight(1)
+		nm, c := m.doFork(sep)
+		return true, nm, c
+
+	case "/trim":
+		n, ok := parseTurnArg(fields)
+		if !ok {
+			m.appendCommandError(sess, "Usage: /trim N  (deletes all messages AFTER turn N)")
+			return true, m, nil
+		}
+		sep, ok := m.turnSepByNumber(sess, n)
+		if !ok {
+			m.appendCommandError(sess, fmt.Sprintf("No such turn: %d", n))
+			return true, m, nil
+		}
+		sess.input.Reset()
+		sess.input.SetHeight(1)
+		sess.trimPrevState = sess.agentState
+		sess.trimSelected = 0
+		sess.trimSep = sep
+		sess.agentState = StateTrimConfirm
+		return true, m, nil
+
+	case "/copy":
+		// Bare /copy copies the whole conversation.
+		if len(fields) == 1 {
+			sess.input.Reset()
+			sess.input.SetHeight(1)
+			cmds := m.handleCommandAction("copy_conversation", sess)
+			return true, m, tea.Batch(cmds...)
+		}
+		n, ok := parseTurnArg(fields)
+		if !ok {
+			m.appendCommandError(sess, "Usage: /copy [N]  (N = turn number; omit to copy all)")
+			return true, m, nil
+		}
+		sep, ok := m.turnSepByNumber(sess, n)
+		if !ok {
+			m.appendCommandError(sess, fmt.Sprintf("No such turn: %d", n))
+			return true, m, nil
+		}
+		sess.input.Reset()
+		sess.input.SetHeight(1)
+		m.copyTurn(sess, n, sep)
+		return true, m, nil
+
+	case "/goto":
+		n, ok := parseTurnArg(fields)
+		if !ok {
+			m.appendCommandError(sess, "Usage: /goto N  (N = turn number)")
+			return true, m, nil
+		}
+		if n > countTurnSeparators(sess.chatMessages) {
+			m.appendCommandError(sess, fmt.Sprintf("No such turn: %d", n))
+			return true, m, nil
+		}
+		sess.input.Reset()
+		sess.input.SetHeight(1)
+		m.gotoTurn(sess, n)
+		return true, m, nil
+	}
+	return false, m, nil
+}
+
+// copyTurn copies just the messages belonging to the given 1-based turn number
+// to the clipboard. The turn's messages are those between the previous turn
+// separator and this one (excluding the separator line itself).
+func (m *Model) copyTurn(sess *SessionState, turnNum int, sep TurnSepInfo) {
+	start := 0
+	if prev, ok := m.turnSepByNumber(sess, turnNum-1); ok {
+		start = prev.MsgIdx + 1
+	}
+	end := sep.MsgIdx // exclusive: skip the separator message
+	if start < 0 {
+		start = 0
+	}
+	if end > len(sess.chatMessages) {
+		end = len(sess.chatMessages)
+	}
+	if start >= end {
+		sess.chatMessages = append(sess.chatMessages, renderSystemMessage(fmt.Sprintf("Turn %d has no messages to copy.", turnNum), m.styles))
+		sess.chatScrollOffset = 0
+		return
+	}
+	text := formatConversationPlainText(sess.chatMessages[start:end])
+	if err := clipboard.WriteAll(text); err != nil {
+		sess.chatMessages = append(sess.chatMessages, renderErrorMessage(fmt.Errorf("failed to copy to clipboard: %w", err)))
+	} else {
+		sess.chatMessages = append(sess.chatMessages, renderSystemMessage(fmt.Sprintf("Copied turn %d to clipboard.", turnNum), m.styles))
+	}
+	sess.chatScrollOffset = 0
+}
+
+// gotoTurn scrolls the chat so the first message of the given 1-based turn
+// number sits at the top of the viewport. Turn N's content starts on the line
+// immediately after turn separator N-1 (or at the very top for turn 1).
+func (m *Model) gotoTurn(sess *SessionState, turnNum int) {
+	innerWidth := m.effectiveChatWidth() - 4
+	if innerWidth < 1 {
+		innerWidth = 1
+	}
+
+	// Logical line (in the rendered chat) where turn turnNum begins.
+	targetLine := 0
+	if turnNum > 1 {
+		for _, sep := range turnSeparatorInfos(sess.chatMessages, m.styles, innerWidth) {
+			if sep.TurnIdx == turnNum-2 {
+				targetLine = sep.LineIdx + strings.Count(sess.chatMessages[sep.MsgIdx].Rendered, "\n")
+				break
+			}
+		}
+	}
+
+	// Rebuild the rendered chat and a visual-row prefix sum, mirroring the
+	// renderer (and sessionMaxScrollOffset), to convert the logical line into a
+	// from-bottom scroll offset.
+	chatContent := buildRenderedChat(sess.chatMessages, m.styles, innerWidth)
 	if sess.showThinking && sess.thinkingRendered != "" {
 		chatContent += sess.thinkingRendered + "\n"
 	}
 	if sess.assistantRendered != "" {
 		chatContent += sess.assistantRendered
 	}
-	innerWidth := m.mdRenderer.width
 	allLines := strings.Split(chatContent, "\n")
+	if targetLine > len(allLines) {
+		targetLine = len(allLines)
+	}
 	visualRowStart := make([]int, len(allLines)+1)
 	for i, line := range allLines {
 		visualRowStart[i+1] = visualRowStart[i] + visualRows(line, innerWidth)
 	}
 	totalVisualRows := visualRowStart[len(allLines)]
-	endVisRow := totalVisualRows - sess.chatScrollOffset
-	if endVisRow < contentHeight {
-		endVisRow = contentHeight
-	}
-	if endVisRow > totalVisualRows {
-		endVisRow = totalVisualRows
-	}
-	endLogical := 0
-	for endLogical < len(allLines) && visualRowStart[endLogical+1] <= endVisRow {
-		endLogical++
-	}
-	accVisRows := 0
-	startLogical := endLogical
-	for startLogical > 0 {
-		rows := visualRows(allLines[startLogical-1], innerWidth)
-		if accVisRows+rows > contentHeight {
-			break
-		}
-		accVisRows += rows
-		startLogical--
-	}
-	for _, s := range turnSeparatorInfos(sess.chatMessages, m.styles, m.mdRenderer.width) {
-		if s.LineIdx >= startLogical && s.LineIdx < endLogical {
-			return s, true
-		}
-	}
-	return TurnSepInfo{}, false
+	startVisRow := visualRowStart[targetLine]
+
+	layout := computeLayout(m.width, m.height, m.visualLineCount())
+	contentHeight := layout.ChatHeight - 1
+
+	sess.chatScrollOffset = totalVisualRows - contentHeight - startVisRow
+	m.clampScrollOffset(sess)
+	sess.focus = FocusChat
 }
 
 // doFork creates a new session seeded with history up to sep, and connects a fork.
@@ -2396,6 +2839,34 @@ func (m *Model) doFork(sep TurnSepInfo) (Model, tea.Cmd) {
 	newIdx := len(m.sessions)
 	m.sessions = append(m.sessions, newSess)
 	m.selectedSession = newIdx
+
+	return *m, connectFork(
+		m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken,
+		m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess,
+		forkSessionID, sep.TurnIdx, newSess.daemonSessionID,
+	)
+}
+
+// doDuplicate creates a new session that is a full copy of srcSess, seeded with
+// the source's conversation history up to its last completed turn (sep), and
+// connects it. Mirrors doFork but operates on an explicit source session (so it
+// can be triggered from the Sessions tab against the highlighted row).
+func (m *Model) doDuplicate(srcSess *SessionState, sep TurnSepInfo) (Model, tea.Cmd) {
+	newSess := newSessionState(m.cfg, nil)
+	newSess.reconnecting = true
+	copiedMsgs := make([]ChatMessage, sep.MsgIdx+1)
+	copy(copiedMsgs, srcSess.chatMessages[:sep.MsgIdx+1])
+	newSess.chatMessages = copiedMsgs
+
+	forkSessionID := ""
+	if srcSess.client != nil {
+		forkSessionID = srcSess.client.SessionID()
+	}
+
+	newIdx := len(m.sessions)
+	m.sessions = append(m.sessions, newSess)
+	m.selectedSession = newIdx
+	m.syncSessionsSelected()
 
 	return *m, connectFork(
 		m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken,
@@ -2465,18 +2936,41 @@ func (m *Model) doCloseSession(sessionIdx int) (Model, tea.Cmd) {
 	return *m, reconnectCmd
 }
 
-// updateChatWidth updates the markdown renderer width to match the current effective chat width.
-func (m *Model) updateChatWidth() {
-	sess := m.currentSession()
+// effectiveChatWidth returns the panel-aware total chat width — the single
+// source of truth for every width-sensitive render. When the right panel is
+// visible it reserves panelWidth columns; otherwise it is the plain layout
+// chat width. Inner content width is effectiveChatWidth() - 4.
+func (m *Model) effectiveChatWidth() int {
 	chatWidth := computeLayout(m.width, m.height, m.visualLineCount()).ChatWidth
-	if sess != nil && sess.rightPanel.IsVisible() {
+	if sess := m.currentSession(); sess != nil && sess.rightPanel.IsVisible() {
 		chatWidth = m.width - sess.rightPanel.PanelWidth()
 		if chatWidth < 10 {
 			chatWidth = 10
 		}
 	}
-	m.mdRenderer.UpdateWidth(chatWidth - 4)
+	return chatWidth
+}
+
+// updateChatWidth updates the markdown renderer width to match the current
+// effective chat width and re-renders the session's cached messages.
+func (m *Model) updateChatWidth() {
+	m.mdRenderer.UpdateWidth(m.effectiveChatWidth() - 4)
 	m.rerenderSessionMessages()
+	m.lastChatWidth = m.effectiveChatWidth()
+}
+
+// reconcileChatWidth re-flows width-cached content (the glamour code box and
+// cached message renders) whenever the effective panel-aware chat width has
+// changed since the last reconciliation. Called centrally from Update so panel
+// open/close, session switches, and resizes all self-heal without each
+// transition having to remember to call updateChatWidth.
+func (m *Model) reconcileChatWidth() {
+	if m.width == 0 {
+		return
+	}
+	if w := m.effectiveChatWidth(); w != m.lastChatWidth {
+		m.updateChatWidth()
+	}
 }
 
 // rerenderSessionMessages re-renders the current session's chat messages at the current width.
@@ -2491,43 +2985,11 @@ func (m *Model) rerenderSessionMessages() {
 	}
 }
 
-// visibleSessionIndices returns the indices of sessions that match the current filter.
+// visibleSessionIndices returns the indices of all sessions.
 func (m *Model) visibleSessionIndices() []int {
-	const colSession = 10
-	const colMessage = 52
-	filterLower := strings.ToLower(m.sessionsInput.Value())
-	var indices []int
-	for i, sess := range m.sessions {
-		if filterLower == "" {
-			indices = append(indices, i)
-			continue
-		}
-		sessionCol := "connecting…"
-		if sess.client != nil {
-			id := sess.client.SessionID()
-			if dash := strings.Index(id, "-"); dash >= 0 {
-				sessionCol = id[:dash]
-			} else if len(id) > colSession {
-				sessionCol = id[:colSession]
-			} else {
-				sessionCol = id
-			}
-		}
-		msgCol := "—"
-		for _, msg := range sess.chatMessages {
-			if msg.Type == MsgUser {
-				line := strings.SplitN(msg.Text, "\n", 2)[0]
-				if len(line) > colMessage {
-					line = line[:colMessage-1] + "…"
-				}
-				msgCol = line
-				break
-			}
-		}
-		if strings.Contains(strings.ToLower(sessionCol), filterLower) ||
-			strings.Contains(strings.ToLower(msgCol), filterLower) {
-			indices = append(indices, i)
-		}
+	indices := make([]int, len(m.sessions))
+	for i := range m.sessions {
+		indices[i] = i
 	}
 	return indices
 }

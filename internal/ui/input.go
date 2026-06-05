@@ -6,7 +6,6 @@ import (
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
-	"charm.land/bubbles/v2/textinput"
 	"charm.land/lipgloss/v2"
 )
 
@@ -17,7 +16,7 @@ func newInput() textarea.Model {
 	ta.Focus()
 	ta.CharLimit = 0 // no limit
 	ta.ShowLineNumbers = false
-	ta.SetHeight(1) // Start with 1 line
+	ta.SetHeight(1)   // Start with 1 line
 	ta.MaxHeight = 10 // Maximum 10 lines before scrolling
 
 	// Show prompt arrow only on the first line, blank indent on continuation lines
@@ -59,14 +58,6 @@ func newInput() textarea.Model {
 	ta.SetStyles(s)
 
 	return ta
-}
-
-// newSessionsInput creates a text input for filtering the sessions overview tab.
-func newSessionsInput() textinput.Model {
-	ti := textinput.New()
-	ti.Placeholder = "Filter sessions…"
-	ti.Prompt = "  "
-	return ti
 }
 
 // renderInputBox wraps the textarea in a rounded border box with mode title embedded in top border.
