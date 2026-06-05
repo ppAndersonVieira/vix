@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/get-vix/vix/internal/daemon/mcp"
 	"github.com/get-vix/vix/internal/daemon/prompt"
 	"github.com/get-vix/vix/internal/protocol"
+	"github.com/get-vix/vix/internal/providers"
 	"github.com/get-vix/vix/internal/telemetry"
 )
 
@@ -49,8 +51,12 @@ type Session struct {
 
 	// Fork snapshots: a copy of messages after each completed normal turn,
 	// protected by mu. Used by snapshotMessagesForFork to seed forked sessions.
-	mu              sync.Mutex
-	turnSnapshots   [][]llm.MessageParam
+	mu            sync.Mutex
+	turnSnapshots [][]llm.MessageParam
+	// lastInputTokens is the true prompt size (input + cache read + cache
+	// creation) of the most recent turn. Drives auto-compaction. Protected
+	// by mu; reset to 0 after a compaction so it doesn't immediately retrigger.
+	lastInputTokens int64
 	activePlan      *protocol.Plan
 	backgroundTasks BackgroundTaskRegistry
 	bashJobs        BashJobRegistry
@@ -1518,6 +1524,32 @@ func (s *Session) handleInput(text string, attachments []protocol.Attachment) {
 		return
 	}
 
+	// /compact [N] — summarize older turns to free context. Handled daemon-side
+	// because it mutates s.messages and needs an LLM call.
+	if text == "/compact" || strings.HasPrefix(text, "/compact ") {
+		n := 0
+		if fields := strings.Fields(text); len(fields) > 1 {
+			v, err := strconv.Atoi(fields[1])
+			if err != nil || v < 1 {
+				s.emit("event.error", protocol.EventError{Message: "Usage: /compact [N]  (N = turn number)"})
+				s.emit("event.agent_done", nil)
+				return
+			}
+			n = v
+		}
+		s.mu.Lock()
+		keepFromMsgIdx, summarizedTurns, ok := s.resolveCompactionKeep(n)
+		s.mu.Unlock()
+		if !ok {
+			s.emit("event.error", protocol.EventError{Message: "Nothing to compact (no earlier turns, or N out of range)."})
+			s.emit("event.agent_done", nil)
+			return
+		}
+		s.compactMessages(keepFromMsgIdx, summarizedTurns, false)
+		s.emit("event.agent_done", nil)
+		return
+	}
+
 	// Validate attachments before adding
 	for _, att := range attachments {
 		if err := protocol.ValidateAttachment(att); err != nil {
@@ -1532,6 +1564,7 @@ func (s *Session) handleInput(text string, attachments []protocol.Attachment) {
 	// Inner loop: agent turns
 	todoNudges := 0
 	for {
+		s.maybeAutoCompact()
 		system := s.buildSystemPrompt()
 
 		msg, elapsed, err := s.streamWithRetry(system, func(delta string) {
@@ -1559,6 +1592,10 @@ func (s *Session) handleInput(text string, attachments []protocol.Attachment) {
 			ElapsedMs:           elapsed.Milliseconds(),
 		})
 		s.accumulateTurnTelemetry(msg.Usage.InputTokens, msg.Usage.OutputTokens, msg.Usage.CacheCreationTokens, msg.Usage.CacheReadTokens, elapsed.Milliseconds(), countToolUses(msg))
+
+		s.mu.Lock()
+		s.lastInputTokens = msg.Usage.InputTokens + msg.Usage.CacheReadTokens + msg.Usage.CacheCreationTokens
+		s.mu.Unlock()
 
 		LogLLMCall(s.model, system, s.messages, s.tools, msg)
 		s.messages = append(s.messages, msg.ToParam())
@@ -1602,6 +1639,186 @@ func (s *Session) handleInput(text string, attachments []protocol.Attachment) {
 	s.turnSnapshots = append(s.turnSnapshots, snapshot)
 	s.mu.Unlock()
 	s.emit("event.agent_done", nil)
+}
+
+// compactionSystemPrompt instructs the model to produce a dense, faithful
+// summary of the dropped conversation prefix during compaction.
+const compactionSystemPrompt = `You are compacting a software-engineering conversation to save context.
+Summarize the messages below into a dense, faithful briefing that lets the assistant continue the work without re-reading them.
+
+Preserve, in this order:
+1. The user's goals and any explicit instructions or constraints still in effect.
+2. Key decisions made and their rationale.
+3. Files created/edited/read (exact paths) and the gist of important changes.
+4. Important tool outputs, command results, errors, and their resolutions.
+5. Open tasks, TODOs, and unresolved questions.
+
+Be concise but specific — keep identifiers, paths, and commands verbatim. Do not invent facts. Do not include a preamble or sign-off; output only the summary.`
+
+// compactionSummaryPrefix labels the synthetic user message that replaces the
+// compacted prefix so the assistant knows it is reading a summary.
+const compactionSummaryPrefix = "[Summary of earlier conversation, compacted to save context]\n\n"
+
+// compactionRequestPrompt is appended as a trailing user message before the
+// summarization call. The dropped prefix always ends on an assistant message
+// (turn boundaries land after the assistant's final response); sending it as-is
+// makes the API treat it as an assistant prefill, which some models reject. The
+// trailing user turn keeps the request valid and states the summarization ask
+// explicitly.
+const compactionRequestPrompt = "Summarize the conversation above following the instructions in the system prompt."
+
+// resolveCompactionKeep maps a compaction policy to a message-index boundary
+// (keepFromMsgIdx) and the count of turns being summarized. explicitN > 0 means
+// /compact N (keep turns after N); otherwise the configured policy applies.
+// Returns ok=false when there is nothing to compact. Must be called under s.mu.
+func (s *Session) resolveCompactionKeep(explicitN int) (keepFromMsgIdx, summarizedTurns int, ok bool) {
+	total := len(s.turnSnapshots)
+	if total == 0 {
+		return 0, 0, false
+	}
+
+	var dropTurns int
+	switch {
+	case explicitN > 0:
+		if explicitN >= total {
+			return 0, 0, false // keep "turns after N" — N must leave a tail
+		}
+		dropTurns = explicitN
+	case s.projectConfig.Compaction.KeepLastNTurns > 0:
+		keep := s.projectConfig.Compaction.KeepLastNTurns
+		if keep >= total {
+			return 0, 0, false
+		}
+		dropTurns = total - keep
+	default: // ratio
+		keep := int(math.Ceil(s.projectConfig.Compaction.KeepRatio * float64(total)))
+		if keep < 1 {
+			keep = 1
+		}
+		if keep >= total {
+			return 0, 0, false
+		}
+		dropTurns = total - keep
+	}
+
+	// turnSnapshots[dropTurns-1] is the cumulative messages prefix through the
+	// last dropped turn — its length is the keep boundary. Snapshots are taken
+	// only at turn boundaries, so this never splits a tool_use/tool_result pair.
+	keepFromMsgIdx = len(s.turnSnapshots[dropTurns-1])
+	return keepFromMsgIdx, dropTurns, true
+}
+
+// maybeAutoCompact compacts the conversation when automatic compaction is
+// enabled, the model's context window is known, and the last turn's prompt
+// exceeded the configured threshold. Called at the top of the turn loop.
+func (s *Session) maybeAutoCompact() {
+	cfg := s.projectConfig.Compaction
+	if !cfg.Auto {
+		return
+	}
+	window := providers.Default().ContextWindow(s.model)
+	if window <= 0 {
+		return // unknown window → safe fallback, no auto-compaction
+	}
+
+	s.mu.Lock()
+	if s.lastInputTokens < int64(cfg.Threshold*float64(window)) {
+		s.mu.Unlock()
+		return
+	}
+	keepFromMsgIdx, summarizedTurns, ok := s.resolveCompactionKeep(0)
+	s.mu.Unlock()
+	if !ok {
+		// Threshold breached but a single trailing turn already fills the
+		// window — nothing safe to compact. Warn once and continue.
+		log.Printf("\033[33m[session] auto-compaction skipped: nothing to compact below threshold\033[0m")
+		return
+	}
+	s.compactMessages(keepFromMsgIdx, summarizedTurns, true)
+}
+
+// compactMessages summarizes s.messages[:keepFromMsgIdx] and replaces the
+// history with [summary, ...tail], rebuilding turnSnapshots to keep the
+// retained turns' boundaries consistent. summarizedTurns is the number of turns
+// folded into the summary. auto distinguishes the trigger source for the event.
+func (s *Session) compactMessages(keepFromMsgIdx, summarizedTurns int, auto bool) {
+	s.mu.Lock()
+	if keepFromMsgIdx <= 0 || keepFromMsgIdx >= len(s.messages) {
+		s.mu.Unlock()
+		s.emit("event.error", protocol.EventError{Message: "Nothing to compact."})
+		return
+	}
+	dropped := make([]llm.MessageParam, keepFromMsgIdx)
+	copy(dropped, s.messages[:keepFromMsgIdx])
+	fromTokens := s.lastInputTokens
+	s.mu.Unlock()
+
+	summary, err := s.summarizeMessages(dropped)
+	if err != nil {
+		s.emit("event.error", protocol.EventError{Message: "Compaction failed: " + err.Error()})
+		return
+	}
+
+	summaryMsg := llm.NewUserMessage(llm.NewTextBlock(compactionSummaryPrefix + summary))
+
+	s.mu.Lock()
+	// History is only mutated by the single-threaded turn loop / command
+	// handler, so keepFromMsgIdx is still valid here.
+	if keepFromMsgIdx >= len(s.messages) {
+		s.mu.Unlock()
+		s.emit("event.error", protocol.EventError{Message: "Nothing to compact."})
+		return
+	}
+	tail := s.messages[keepFromMsgIdx:]
+	newMessages := make([]llm.MessageParam, 0, 1+len(tail))
+	newMessages = append(newMessages, summaryMsg)
+	newMessages = append(newMessages, tail...)
+
+	// Rebuild turnSnapshots for the kept turns, re-based onto newMessages. The
+	// summary occupies index 0, so a kept turn's old boundary len(s_j) maps to
+	// 1 + (len(s_j) - keepFromMsgIdx).
+	var newSnapshots [][]llm.MessageParam
+	for j := summarizedTurns; j < len(s.turnSnapshots); j++ {
+		boundary := 1 + (len(s.turnSnapshots[j]) - keepFromMsgIdx)
+		if boundary < 1 {
+			boundary = 1
+		}
+		if boundary > len(newMessages) {
+			boundary = len(newMessages)
+		}
+		snap := make([]llm.MessageParam, boundary)
+		copy(snap, newMessages[:boundary])
+		newSnapshots = append(newSnapshots, snap)
+	}
+
+	s.messages = newMessages
+	s.turnSnapshots = newSnapshots
+	s.lastInputTokens = 0 // recomputed on the next turn; avoids immediate retrigger
+	s.mu.Unlock()
+
+	s.emit("event.compacted", protocol.EventCompacted{
+		FromTokens:      fromTokens,
+		SummarizedTurns: summarizedTurns,
+		Auto:            auto,
+	})
+}
+
+// summarizeMessages runs a one-shot, tool-free LLM call to summarize the given
+// messages. Streaming deltas are discarded (no UI side-effects).
+func (s *Session) summarizeMessages(msgs []llm.MessageParam) (string, error) {
+	system := []llm.SystemBlock{{Text: compactionSystemPrompt}}
+	// Ensure the conversation ends on a user message: the dropped prefix ends on
+	// an assistant turn, which the API would otherwise treat as a prefill.
+	msgs = append(msgs[:len(msgs):len(msgs)], llm.NewUserMessage(llm.NewTextBlock(compactionRequestPrompt)))
+	msg, _, err := s.llm.StreamMessage(s.ctx, system, msgs, nil, func(string) {}, func(string) {})
+	if err != nil {
+		return "", err
+	}
+	summary := strings.TrimSpace(msg.TextContent)
+	if summary == "" {
+		return "", fmt.Errorf("summarization produced no text")
+	}
+	return summary, nil
 }
 
 // interactiveTools are tools that require sequential execution (user interaction, blocking waits).

@@ -32,13 +32,13 @@ type SessionEvent struct {
 
 // SessionStartData is sent to start a new agent session.
 type SessionStartData struct {
-	CWD                             string `json:"cwd"`
-	ConfigDir                       string `json:"config_dir,omitempty"`
-	Model                           string `json:"model"`
-	ForceInit                       bool   `json:"force_init"`
-	EnableAutomaticWritePermission bool `json:"enable_automatic_write_permission"`
-	EnableAutomaticDirectoryAccess bool `json:"enable_automatic_directory_access"`
-	Headless                        bool   `json:"headless"`
+	CWD                            string `json:"cwd"`
+	ConfigDir                      string `json:"config_dir,omitempty"`
+	Model                          string `json:"model"`
+	ForceInit                      bool   `json:"force_init"`
+	EnableAutomaticWritePermission bool   `json:"enable_automatic_write_permission"`
+	EnableAutomaticDirectoryAccess bool   `json:"enable_automatic_directory_access"`
+	Headless                       bool   `json:"headless"`
 	// Fork fields: when ForkSessionID is non-empty the new session is seeded
 	// with the conversation history of the named session up to and including
 	// the turn at ForkTurnIdx (0-based).
@@ -149,6 +149,16 @@ type EventStreamDone struct {
 	ElapsedMs           int64 `json:"elapsed_ms"`
 }
 
+// EventCompacted signals that the conversation history was summarized to free
+// context. FromTokens is the prompt size before compaction; ToTokens is 0 when
+// the post-compaction size is not yet known (recomputed on the next turn).
+type EventCompacted struct {
+	FromTokens      int64 `json:"from_tokens"`
+	ToTokens        int64 `json:"to_tokens"`
+	SummarizedTurns int   `json:"summarized_turns"`
+	Auto            bool  `json:"auto"` // true = auto-trigger, false = /compact
+}
+
 // EventToolCall indicates a tool call is starting.
 type EventToolCall struct {
 	ToolID string `json:"tool_id"`
@@ -167,9 +177,9 @@ type EventToolCall struct {
 	// `timeout` override.
 	TimeoutSec int `json:"timeout_sec,omitempty"`
 	// Bash-specific alternative-tool justifications (omitted when empty or "N/A").
-	ReasonNotReadFile       string `json:"reason_not_read_file,omitempty"`
-	ReasonNotEditFile       string `json:"reason_not_edit_file,omitempty"`
-	ReasonNotGlobFiles      string `json:"reason_not_glob_files,omitempty"`
+	ReasonNotReadFile  string `json:"reason_not_read_file,omitempty"`
+	ReasonNotEditFile  string `json:"reason_not_edit_file,omitempty"`
+	ReasonNotGlobFiles string `json:"reason_not_glob_files,omitempty"`
 	// ReasonToIncreaseTimeout is the model's justification for raising the
 	// bash/glob_files timeout above the 120s default. Populated from the
 	// `reason_to_increase_timeout` field of the tool input.
@@ -318,7 +328,7 @@ type EventWorkflowStepDone struct {
 	Success             bool       `json:"success"`
 	TimedOut            bool       `json:"timed_out,omitempty"` // bash step killed by per-step timeout; workflow continues
 	Display             string     `json:"display,omitempty"`
-	Command             string     `json:"command,omitempty"`  // bash step: resolved command that was run
+	Command             string     `json:"command,omitempty"`     // bash step: resolved command that was run
 	BashOutput          string     `json:"bash_output,omitempty"` // bash step: first 5 lines of output
 	Model               string     `json:"model,omitempty"`
 	InputTokens         int64      `json:"input_tokens,omitempty"`

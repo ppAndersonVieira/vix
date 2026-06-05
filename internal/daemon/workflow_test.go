@@ -143,7 +143,7 @@ func TestValidateWorkflow(t *testing.T) {
 				Name:       "Test Plan",
 				EntryPoint: StepRef{ID: "step1"},
 				Steps: map[string]WorkflowStepDef{
-					"step1":  {Type: "agent", Agent: "planner", Prompt: "do something", NextSteps: []StepRef{{ID: "review"}}},
+					"step1": {Type: "agent", Agent: "planner", Prompt: "do something", NextSteps: []StepRef{{ID: "review"}}},
 					"review": {Type: "tool", Tool: "ask_question_to_user", Options: []StepOption{
 						{Title: "Accept", Description: "Approve", Steps: []StepRef{{ID: "step1"}}},
 						{Title: "Reject", Description: "Reject", Steps: []StepRef{{ID: "stop"}}},
@@ -169,7 +169,7 @@ func TestValidateWorkflow(t *testing.T) {
 				Name:       "Test Plan",
 				EntryPoint: StepRef{ID: "step1"},
 				Steps: map[string]WorkflowStepDef{
-					"step1":  {Type: "agent", Agent: "planner", Prompt: "do something", NextSteps: []StepRef{{ID: "review"}}},
+					"step1": {Type: "agent", Agent: "planner", Prompt: "do something", NextSteps: []StepRef{{ID: "review"}}},
 					"review": {Type: "tool", Tool: "ask_question_to_user", Options: []StepOption{
 						{Title: "Accept", Description: "Approve", Steps: []StepRef{{ID: "nonexistent"}}},
 					}},
@@ -183,7 +183,7 @@ func TestValidateWorkflow(t *testing.T) {
 				Name:       "Test Plan",
 				EntryPoint: StepRef{ID: "step1"},
 				Steps: map[string]WorkflowStepDef{
-					"step1":  {Type: "agent", Agent: "planner", Prompt: "do something", NextSteps: []StepRef{{ID: "review"}}},
+					"step1": {Type: "agent", Agent: "planner", Prompt: "do something", NextSteps: []StepRef{{ID: "review"}}},
 					"review": {Type: "tool", Tool: "ask_question_to_user", Options: []StepOption{
 						{Title: "Reject", Description: "Reject the plan", Steps: []StepRef{{ID: "stop"}}},
 					}},
@@ -197,7 +197,7 @@ func TestValidateWorkflow(t *testing.T) {
 				Name:       "Test Plan",
 				EntryPoint: StepRef{ID: "step1"},
 				Steps: map[string]WorkflowStepDef{
-					"step1":  {Type: "agent", Agent: "planner", Prompt: "do something", NextSteps: []StepRef{{ID: "review"}}},
+					"step1": {Type: "agent", Agent: "planner", Prompt: "do something", NextSteps: []StepRef{{ID: "review"}}},
 					"review": {Type: "tool", Tool: "ask_question_to_user", Options: []StepOption{
 						{Title: "Accept", Description: "Approve", Steps: []StepRef{{ID: "step1"}}},
 						{Title: "Modify", Description: "Provide feedback", Steps: []StepRef{{ID: "step1"}}, HasUserInput: true},
@@ -767,6 +767,129 @@ func TestLoadProjectConfigToolTimeouts(t *testing.T) {
 	})
 }
 
+// ── LoadProjectConfig: compaction block ──
+
+func TestLoadProjectConfigCompaction(t *testing.T) {
+	writeSettings := func(t *testing.T, path string, cfg configFile) {
+		t.Helper()
+		data, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := os.WriteFile(path, data, 0644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	fp := func(v float64) *float64 { return &v }
+	bp := func(v bool) *bool { return &v }
+	ip := func(v int) *int { return &v }
+
+	expect := func(t *testing.T, got Compaction, threshold float64, auto bool, keepN int, keepRatio float64) {
+		t.Helper()
+		if got.Threshold != threshold || got.Auto != auto || got.KeepLastNTurns != keepN || got.KeepRatio != keepRatio {
+			t.Errorf("Compaction = %+v, want {Threshold:%v Auto:%v KeepLastNTurns:%v KeepRatio:%v}",
+				got, threshold, auto, keepN, keepRatio)
+		}
+	}
+
+	t.Run("absent block falls back to defaults", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "settings.json")
+		writeSettings(t, path, configFile{Version: CurrentConfigVersion})
+
+		result := LoadProjectConfig(path)
+		expect(t, result.Compaction, defaultCompactionThreshold, defaultCompactionAuto, defaultCompactionKeepLastN, defaultCompactionKeepRatio)
+	})
+
+	t.Run("full valid block is honored", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "settings.json")
+		writeSettings(t, path, configFile{
+			Version:    CurrentConfigVersion,
+			Compaction: &compactionFile{Threshold: fp(0.6), Auto: bp(false), KeepLastNTurns: ip(4)},
+		})
+
+		result := LoadProjectConfig(path)
+		expect(t, result.Compaction, 0.6, false, 4, defaultCompactionKeepRatio)
+	})
+
+	t.Run("partial block: only threshold set, others inherit defaults", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "settings.json")
+		writeSettings(t, path, configFile{
+			Version:    CurrentConfigVersion,
+			Compaction: &compactionFile{Threshold: fp(0.5)},
+		})
+
+		result := LoadProjectConfig(path)
+		expect(t, result.Compaction, 0.5, defaultCompactionAuto, defaultCompactionKeepLastN, defaultCompactionKeepRatio)
+	})
+
+	t.Run("invalid threshold is ignored", func(t *testing.T) {
+		for _, bad := range []float64{0, 1.5, -0.2} {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "settings.json")
+			writeSettings(t, path, configFile{
+				Version:    CurrentConfigVersion,
+				Compaction: &compactionFile{Threshold: fp(bad)},
+			})
+
+			result := LoadProjectConfig(path)
+			if result.Compaction.Threshold != defaultCompactionThreshold {
+				t.Errorf("threshold %v: got %v, want default %v", bad, result.Compaction.Threshold, defaultCompactionThreshold)
+			}
+		}
+	})
+
+	t.Run("threshold of 1 is valid (inclusive)", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "settings.json")
+		writeSettings(t, path, configFile{
+			Version:    CurrentConfigVersion,
+			Compaction: &compactionFile{Threshold: fp(1)},
+		})
+
+		result := LoadProjectConfig(path)
+		if result.Compaction.Threshold != 1 {
+			t.Errorf("threshold = %v, want 1", result.Compaction.Threshold)
+		}
+	})
+
+	t.Run("keep_last_n_turns below -1 is clamped to -1", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "settings.json")
+		writeSettings(t, path, configFile{
+			Version:    CurrentConfigVersion,
+			Compaction: &compactionFile{KeepLastNTurns: ip(-5)},
+		})
+
+		result := LoadProjectConfig(path)
+		if result.Compaction.KeepLastNTurns != -1 {
+			t.Errorf("KeepLastNTurns = %v, want -1", result.Compaction.KeepLastNTurns)
+		}
+	})
+
+	t.Run("multi-file: later override wins field-by-field", func(t *testing.T) {
+		homeDir := t.TempDir()
+		projectDir := t.TempDir()
+		homePath := filepath.Join(homeDir, "settings.json")
+		projectPath := filepath.Join(projectDir, "settings.json")
+
+		writeSettings(t, homePath, configFile{
+			Version:    CurrentConfigVersion,
+			Compaction: &compactionFile{Auto: bp(false)},
+		})
+		writeSettings(t, projectPath, configFile{
+			Version:    CurrentConfigVersion,
+			Compaction: &compactionFile{Threshold: fp(0.6)},
+		})
+
+		result := LoadProjectConfig(homePath, projectPath)
+		// Home disabled auto; project set threshold only — both apply.
+		expect(t, result.Compaction, 0.6, false, defaultCompactionKeepLastN, defaultCompactionKeepRatio)
+	})
+}
+
 // ── LoadConfig ──
 
 func TestLoadConfig(t *testing.T) {
@@ -1065,10 +1188,10 @@ func TestResolveBashStepTimeout(t *testing.T) {
 	cfg := BashStepTimeouts{Default: 300 * time.Second, Max: 600 * time.Second}
 
 	cases := []struct {
-		name    string
-		step    *int
-		cfg     BashStepTimeouts
-		want    time.Duration
+		name string
+		step *int
+		cfg  BashStepTimeouts
+		want time.Duration
 	}{
 		{"absent override uses default", nil, cfg, 300 * time.Second},
 		{"positive override wins", ip(30), cfg, 30 * time.Second},

@@ -41,43 +41,43 @@ type StepRef struct {
 
 // WorkflowDef is the parsed config for a workflow.
 type WorkflowDef struct {
-	Name       string                      `json:"name"`
-	EntryPoint StepRef                     `json:"entry_point"`
-	Steps      map[string]WorkflowStepDef  `json:"steps"`
-	Summary    string                      `json:"summary,omitempty"`
+	Name       string                     `json:"name"`
+	EntryPoint StepRef                    `json:"entry_point"`
+	Steps      map[string]WorkflowStepDef `json:"steps"`
+	Summary    string                     `json:"summary,omitempty"`
 }
 
 // StepOption is a structured option for tool steps using ask_question_to_user.
 type StepOption struct {
-	Title        string   `json:"title"`
-	Description  string   `json:"description"`
+	Title        string    `json:"title"`
+	Description  string    `json:"description"`
 	Steps        []StepRef `json:"steps,omitempty"`
-	HasUserInput bool     `json:"has_user_input,omitempty"`
+	HasUserInput bool      `json:"has_user_input,omitempty"`
 }
 
 // WorkflowStepDef defines one step in the workflow.
 type WorkflowStepDef struct {
-	Type        string              `json:"type"`                    // "agent", "tool", or "bash" (required)
-	Effort      string              `json:"effort,omitempty"`        // "adaptive", "low", "medium", "high", "max"
-	NextSteps   []StepRef           `json:"next_steps,omitempty"`    // next steps to execute (empty = end workflow)
-	InputParams map[string]InputDef `json:"input_params,omitempty"`  // declared input parameters for this step
-	Tool        string              `json:"tool,omitempty"`          // tool name for type="tool"
-	Agent       string              `json:"agent,omitempty"`         // agent name (loaded from .vix/agents/)
-	ForkFrom    string              `json:"fork_from,omitempty"`     // fork from a prior step's agent
-	Prompt      string              `json:"prompt,omitempty"`        // template, supports $() syntax
-	Command     string              `json:"command,omitempty"`       // bash command for type="bash"
-	Input       string              `json:"input,omitempty"`         // piped to stdin (supports $() expansion)
-	Output      string              `json:"output,omitempty"`        // file path to write step text output
-	DenyTools   []string            `json:"deny_tools,omitempty"`    // tools blocked from executing
-	Stream      *bool               `json:"stream,omitempty"`        // nil defaults to true
-	Silent      bool                `json:"silent,omitempty"`        // suppress all TUI events + vixd dispatch logs for this step
-	JSONOutput  bool                `json:"json_output,omitempty"`   // parse LLM output as JSON for variable expansion
-	DisplayKey  string              `json:"display_key,omitempty"`   // JSON key to extract as per-step display text
-	Explanation string              `json:"explanation,omitempty"`   // user-facing explanation shown at step start
-	Question    string              `json:"question,omitempty"`      // question text for tool steps
-	Options     []StepOption        `json:"options,omitempty"`       // structured options for ask_question_to_user
-	Category    string              `json:"category,omitempty"`      // tab/category label for ask_question_to_user
-	TimeoutSec  *int                `json:"timeout_sec,omitempty"`   // per-step timeout (type="bash" only); pointer distinguishes absent from 0
+	Type        string              `json:"type"`                   // "agent", "tool", or "bash" (required)
+	Effort      string              `json:"effort,omitempty"`       // "adaptive", "low", "medium", "high", "max"
+	NextSteps   []StepRef           `json:"next_steps,omitempty"`   // next steps to execute (empty = end workflow)
+	InputParams map[string]InputDef `json:"input_params,omitempty"` // declared input parameters for this step
+	Tool        string              `json:"tool,omitempty"`         // tool name for type="tool"
+	Agent       string              `json:"agent,omitempty"`        // agent name (loaded from .vix/agents/)
+	ForkFrom    string              `json:"fork_from,omitempty"`    // fork from a prior step's agent
+	Prompt      string              `json:"prompt,omitempty"`       // template, supports $() syntax
+	Command     string              `json:"command,omitempty"`      // bash command for type="bash"
+	Input       string              `json:"input,omitempty"`        // piped to stdin (supports $() expansion)
+	Output      string              `json:"output,omitempty"`       // file path to write step text output
+	DenyTools   []string            `json:"deny_tools,omitempty"`   // tools blocked from executing
+	Stream      *bool               `json:"stream,omitempty"`       // nil defaults to true
+	Silent      bool                `json:"silent,omitempty"`       // suppress all TUI events + vixd dispatch logs for this step
+	JSONOutput  bool                `json:"json_output,omitempty"`  // parse LLM output as JSON for variable expansion
+	DisplayKey  string              `json:"display_key,omitempty"`  // JSON key to extract as per-step display text
+	Explanation string              `json:"explanation,omitempty"`  // user-facing explanation shown at step start
+	Question    string              `json:"question,omitempty"`     // question text for tool steps
+	Options     []StepOption        `json:"options,omitempty"`      // structured options for ask_question_to_user
+	Category    string              `json:"category,omitempty"`     // tab/category label for ask_question_to_user
+	TimeoutSec  *int                `json:"timeout_sec,omitempty"`  // per-step timeout (type="bash" only); pointer distinguishes absent from 0
 }
 
 // IsStreamVisible returns whether streaming output should be shown for this step.
@@ -118,8 +118,8 @@ type AgentRunner struct {
 // WorkflowRun tracks a running workflow.
 type WorkflowRun struct {
 	Def         *WorkflowDef
-	StepAgents  map[string]*AgentRunner  // step_id -> runner used
-	StepResults map[string]*StepResult   // step_id -> result
+	StepAgents  map[string]*AgentRunner // step_id -> runner used
+	StepResults map[string]*StepResult  // step_id -> result
 }
 
 // FeatureToolOrchestrator is the feature flag name for the tool orchestrator mode.
@@ -154,6 +154,15 @@ const (
 	defaultBashStepTimeoutMax     = 600 * time.Second
 )
 
+// Package-level defaults for conversation compaction. Used as the fall-back in
+// LoadProjectConfig when the `compaction` block is absent or partially set.
+const (
+	defaultCompactionThreshold = 0.8  // fraction of context window that triggers auto-compaction
+	defaultCompactionAuto      = true // master switch for automatic compaction
+	defaultCompactionKeepLastN = -1   // -1 = use ratio; >0 = keep exactly N turns
+	defaultCompactionKeepRatio = 0.25 // trailing fraction of turns kept when KeepLastNTurns <= 0
+)
+
 // toolTimeoutsFile is the JSON shape of the `tool_timeouts` block in
 // settings.json. Fields are *int so we can distinguish "absent" from "0",
 // where "0" is explicitly invalid.
@@ -185,6 +194,24 @@ type BashStepTimeouts struct {
 	Max     time.Duration
 }
 
+// compactionFile is the JSON shape of the `compaction` block in settings.json.
+// Pointer fields distinguish "absent" (nil) from an explicit zero value.
+type compactionFile struct {
+	Threshold      *float64 `json:"threshold,omitempty"`
+	Auto           *bool    `json:"auto,omitempty"`
+	KeepLastNTurns *int     `json:"keep_last_n_turns,omitempty"`
+}
+
+// Compaction is the resolved (validated, defaulted) form of the `compaction`
+// block, stored on ProjectConfig and consumed by the auto-compaction logic and
+// the /compact command in session.go.
+type Compaction struct {
+	Threshold      float64 // (0,1]; default 0.8
+	Auto           bool    // default true
+	KeepLastNTurns int     // -1 = use ratio; >0 = keep exactly N trailing turns
+	KeepRatio      float64 // default 0.25; used when KeepLastNTurns <= 0
+}
+
 // configFile represents the top-level settings.json structure.
 type configFile struct {
 	Version            int                   `json:"version,omitempty"`
@@ -195,6 +222,7 @@ type configFile struct {
 	Features           map[string]bool       `json:"features,omitempty"`
 	ToolTimeouts       *toolTimeoutsFile     `json:"tool_timeouts,omitempty"`
 	BashStepTimeouts   *bashStepTimeoutsFile `json:"bash_step_timeouts,omitempty"`
+	Compaction         *compactionFile       `json:"compaction,omitempty"`
 	MCPServers         []mcp.ServerConfig    `json:"mcp_servers,omitempty"`
 }
 
@@ -236,6 +264,7 @@ type ProjectConfig struct {
 	Features           map[string]bool
 	ToolTimeouts       ToolTimeouts
 	BashStepTimeouts   BashStepTimeouts
+	Compaction         Compaction
 	MCPServers         []mcp.ServerConfig
 }
 
@@ -273,6 +302,12 @@ func LoadProjectConfig(configPaths ...string) ProjectConfig {
 		BashStepTimeouts: BashStepTimeouts{
 			Default: defaultBashStepTimeoutDefault,
 			Max:     defaultBashStepTimeoutMax,
+		},
+		Compaction: Compaction{
+			Threshold:      defaultCompactionThreshold,
+			Auto:           defaultCompactionAuto,
+			KeepLastNTurns: defaultCompactionKeepLastN,
+			KeepRatio:      defaultCompactionKeepRatio,
 		},
 	}
 
@@ -426,6 +461,30 @@ func LoadProjectConfig(configPaths ...string) ProjectConfig {
 			}
 			result.BashStepTimeouts = next
 		}
+		if cfg.Compaction != nil {
+			// Mirrors the timeout merges above: partial blocks honour whichever
+			// knob they set, absent blocks preserve an earlier file's value, and
+			// invalid values are ignored with a log line.
+			next := result.Compaction
+			if cfg.Compaction.Threshold != nil {
+				if t := *cfg.Compaction.Threshold; t > 0 && t <= 1 {
+					next.Threshold = t
+				} else {
+					log.Printf("[config] %s: compaction.threshold must be in (0,1], ignoring", configPath)
+				}
+			}
+			if cfg.Compaction.Auto != nil {
+				next.Auto = *cfg.Compaction.Auto
+			}
+			if cfg.Compaction.KeepLastNTurns != nil {
+				n := *cfg.Compaction.KeepLastNTurns
+				if n < -1 {
+					n = -1
+				}
+				next.KeepLastNTurns = n
+			}
+			result.Compaction = next
+		}
 		// Merge MCP servers: later layer overrides by name, new names are appended.
 		for _, srv := range cfg.MCPServers {
 			if srv.Name == "" {
@@ -472,7 +531,6 @@ func LoadProjectConfig(configPaths ...string) ProjectConfig {
 
 	return result
 }
-
 
 // PersistAllowedDirectory appends directories to the allowed_directories list
 // in a settings.json file. Uses map[string]any for round-trip safety so that
