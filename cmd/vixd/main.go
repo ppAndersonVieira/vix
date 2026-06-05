@@ -13,11 +13,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/get-vix/vix/internal/config"
 	"github.com/get-vix/vix/internal/daemon"
 	"github.com/get-vix/vix/internal/daemon/brain"
+	"github.com/get-vix/vix/internal/providers"
 	"github.com/get-vix/vix/internal/telemetry"
+	"github.com/google/uuid"
 )
 
 var Version = "dev"
@@ -85,7 +86,7 @@ func main() {
 	log.SetPrefix("[vixd] ")
 	defer log.Printf("vixd exiting")
 	daemon.ProtectDaemon()
-	cred := config.ResolveProviderCredential("anthropic", true)
+	cred := config.ResolveProviderCredential("anthropic")
 	if cred.Value != "" {
 		log.Printf("API key loaded (source: %s)", cred.Source)
 	} else {
@@ -145,6 +146,12 @@ func main() {
 
 	cwd, _ := os.Getwd()
 	pluginPaths := config.NewVixPaths("", config.HomeVixDir(), cwd)
+	// Load the data-driven provider/model registry: embedded defaults overlaid
+	// by ~/.vix and ./.vix providers.json. On error, log and fall back to the
+	// embedded defaults (providers.Default() lazy-loads them).
+	if err := providers.Configure(pluginPaths.Providers()); err != nil {
+		log.Printf("[providers] using embedded defaults: %v", err)
+	}
 	pluginCfg := daemon.LoadPlugins(pluginPaths.Plugins(), Version, model)
 
 	server := daemon.NewServer(*socketPathFlag, cred, sessionID, model, daemonConfig, pluginCfg)

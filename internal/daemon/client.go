@@ -30,7 +30,7 @@ type Client struct {
 	// `auth_token` field. Set via SetAuthToken from cmd/vix/main.go after
 	// reading the token file pointed at by -auth-token-path. Empty when the
 	// daemon is also unauthenticated (the default when vixd was started
-// without -auth-token-path, or in-process test embeddings).
+	// without -auth-token-path, or in-process test embeddings).
 	authToken string
 }
 

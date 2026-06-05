@@ -71,6 +71,17 @@ func (p VixPaths) Settings() []string {
 	return out
 }
 
+// Providers returns the providers.json paths to merge, in load order (later
+// overrides earlier). These overlay the binary's embedded providers.json.
+func (p VixPaths) Providers() []string {
+	layers := p.Layers()
+	out := make([]string, len(layers))
+	for i, d := range layers {
+		out[i] = filepath.Join(d, "providers.json")
+	}
+	return out
+}
+
 // Agents returns the agents/ directories to scan, in load order (later wins).
 func (p VixPaths) Agents() []string {
 	return p.subdirs("agents")

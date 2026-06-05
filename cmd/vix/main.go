@@ -22,6 +22,7 @@ import (
 	"github.com/get-vix/vix/internal/daemon"
 	"github.com/get-vix/vix/internal/daemon/brain"
 	"github.com/get-vix/vix/internal/headless"
+	"github.com/get-vix/vix/internal/providers"
 	"github.com/get-vix/vix/internal/telemetry"
 
 	"github.com/get-vix/vix/internal/ui"
@@ -168,10 +169,10 @@ func main() {
 	// (OPENAI_API_KEY / OPENROUTER_API_KEY / MINIMAX_API_KEY / MIMO_API_KEY)
 	// themselves.
 	var apiKey string
-	apiKey, _ = config.ResolveProviderKey("anthropic", true) // also accepts CLAUDE_CODE_OAUTH_TOKEN
+	apiKey, _ = config.ResolveProviderKey("anthropic") // includes CLAUDE_CODE_OAUTH_TOKEN fallback
 	hasNonAnthropicKey := func() bool {
 		for _, p := range []string{"openai", "openrouter", "minimax", "mimo"} {
-			if k, _ := config.ResolveProviderKey(p, false); k != "" {
+			if k, _ := config.ResolveProviderKey(p); k != "" {
 				return true
 			}
 		}
@@ -211,6 +212,13 @@ func main() {
 		if err := config.BootstrapHomeVixDir(cfg.ConfigDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: bootstrap of --config-dir failed: %v\n", err)
 		}
+	}
+
+	// Load the data-driven provider/model registry so the model picker reflects
+	// embedded defaults plus any ~/.vix and ./.vix providers.json overlays. On
+	// error, fall back to the embedded defaults.
+	if err := providers.Configure(cfg.Paths.Providers()); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: providers config failed, using embedded defaults: %v\n", err)
 	}
 
 	appMode := "tui"

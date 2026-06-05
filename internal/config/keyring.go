@@ -1,16 +1,29 @@
 package config
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/zalando/go-keyring"
+
+	"github.com/get-vix/vix/internal/auth"
 )
 
 const (
 	keyringService = "vix"
+)
+
+// Auth-default kinds: which credential method a provider prefers when more than
+// one is available. Stored as a small non-secret marker in the OS keychain
+// (see ProviderAuthDefault) so the preference lives alongside the credentials
+// it governs and is honored by credential resolution everywhere.
+const (
+	AuthDefaultAPIKey = "api_key"
+	AuthDefaultOAuth  = "oauth"
 )
 
 // KeySource describes where the API key was found.
@@ -24,21 +37,32 @@ const (
 	KeySourceNone       KeySource = "none"
 )
 
-// Credential bundles an API key or OAuth token with its source.
-// Use RequestOptions() to get the correct SDK auth options.
+// Credential bundles an API key or OAuth token with everything an adapter
+// needs to authenticate: its source (for display), the wire header style, an
+// optional endpoint override, and any extra headers implied by the auth method.
 type Credential struct {
-	Value  string
-	Source KeySource
+	Value        string
+	Source       KeySource
+	HeaderStyle  HeaderStyle       // "" (APIKeyHeader) means SDK-native API key header
+	BaseURL      string            // "" means use the adapter's default endpoint
+	ExtraHeaders map[string]string // applied verbatim on every request
 }
 
-// RequestOptions returns the appropriate Anthropic SDK options for this credential.
+// RequestOptions returns the appropriate Anthropic SDK options for this
+// credential, driven by HeaderStyle and ExtraHeaders. BearerHeader sends an
+// Authorization: Bearer token; otherwise the value is sent as the API key
+// (x-api-key on Anthropic).
 func (c Credential) RequestOptions() []option.RequestOption {
-	if c.Source == KeySourceOAuthToken {
-		return []option.RequestOption{
-			option.WithHeader("Authorization", "Bearer "+c.Value),
-		}
+	var opts []option.RequestOption
+	if c.HeaderStyle == BearerHeader {
+		opts = append(opts, option.WithHeader("Authorization", "Bearer "+c.Value))
+	} else {
+		opts = append(opts, option.WithAPIKey(c.Value))
 	}
-	return []option.RequestOption{option.WithAPIKey(c.Value)}
+	for k, v := range c.ExtraHeaders {
+		opts = append(opts, option.WithHeader(k, v))
+	}
+	return opts
 }
 
 // ResolveEnvVar checks the environment and .env files for a variable.
@@ -62,28 +86,11 @@ type ProviderKey struct {
 	Prefix   string // first 10 chars of the stored key, for display; empty if not stored
 }
 
-// providerKeyringUser returns the keyring "user" field for a given provider.
-// e.g. "anthropic" → "anthropic-api-key", "openai" → "openai-api-key"
+// providerKeyringUser returns the keyring "user" field for storing a provider's
+// primary API key, e.g. "anthropic" → "anthropic-api-key". Used by the
+// store/delete/list helpers; credential resolution uses AuthMethod.Keyring.
 func providerKeyringUser(provider string) string {
 	return provider + "-api-key"
-}
-
-// providerEnvVar returns the environment variable name for a given provider.
-func providerEnvVar(provider string) string {
-	switch provider {
-	case "anthropic":
-		return "ANTHROPIC_API_KEY"
-	case "openai":
-		return "OPENAI_API_KEY"
-	case "openrouter":
-		return "OPENROUTER_API_KEY"
-	case "minimax":
-		return "MINIMAX_API_KEY"
-	case "mimo":
-		return "MIMO_API_KEY"
-	default:
-		return ""
-	}
 }
 
 // resolveKey searches env var, OS keychain, and .env files for the given variable name
@@ -118,41 +125,122 @@ func resolveKey(envVar, keyringUser string) (string, KeySource) {
 	return "", KeySourceNone
 }
 
-// ResolveOAuthToken resolves the CLAUDE_CODE_OAUTH_TOKEN through the standard
-// source chain (env var → keychain → .env) and returns its value and source.
-func ResolveOAuthToken() (string, KeySource) {
-	key, _ := resolveKey("CLAUDE_CODE_OAUTH_TOKEN", "claude-code-oauth-token")
-	if key != "" {
-		return key, KeySourceOAuthToken
-	}
-	return "", KeySourceNone
+// ResolveProviderCredential resolves a Credential for the given provider by
+// walking its AuthMethods (see providers.go) in priority order and returning
+// the first that yields a value. API-key methods are resolved env → keychain →
+// .env (env-first); OAuth methods are resolved from the keychain-backed auth
+// subsystem (without refreshing). Returns a KeySourceNone credential when
+// nothing is found.
+func ResolveProviderCredential(provider string) Credential {
+	return resolveProviderCredential(context.Background(), provider, false)
 }
 
-// ResolveProviderKey checks all sources in priority order and returns the key and its source.
-// For anthropic, ANTHROPIC_API_KEY is checked across all sources first, then
-// CLAUDE_CODE_OAUTH_TOKEN is checked across all sources as a fallback (only when allowOAuth is true).
-func ResolveProviderKey(provider string, allowOAuth bool) (key string, source KeySource) {
-	envVar := providerEnvVar(provider)
-	key, source = resolveKey(envVar, providerKeyringUser(provider))
-	if key != "" {
-		return key, source
-	}
+// ResolveProviderCredentialFresh behaves like ResolveProviderCredential but
+// refreshes an expired stored OAuth access token first (bounded by ctx).
+func ResolveProviderCredentialFresh(ctx context.Context, provider string) Credential {
+	return resolveProviderCredential(ctx, provider, true)
+}
 
-	// Fall back to Claude Code OAuth token (anthropic only)
-	if allowOAuth && provider == "anthropic" {
-		key, source = resolveKey("CLAUDE_CODE_OAUTH_TOKEN", "claude-code-oauth-token")
-		if key != "" {
-			return key, KeySourceOAuthToken
+func resolveProviderCredential(ctx context.Context, provider string, refresh bool) Credential {
+	for _, m := range orderedAuthMethods(provider) {
+		switch m.Kind {
+		case APIKeyAuth:
+			value, src := resolveKey(m.EnvVar, m.Keyring)
+			if value == "" {
+				continue
+			}
+			if m.HeaderStyle == BearerHeader {
+				src = KeySourceOAuthToken
+			}
+			return buildCredential(value, src, m)
+		case OAuthMintKey, OAuthToken:
+			value := resolveOAuthValue(ctx, m.LoginID, refresh)
+			if value == "" {
+				continue
+			}
+			return buildCredential(value, KeySourceOAuthToken, m)
 		}
 	}
-
-	return "", KeySourceNone
+	return Credential{Source: KeySourceNone}
 }
 
-// ResolveProviderCredential returns a Credential for the given provider.
-func ResolveProviderCredential(provider string, allowOAuth bool) Credential {
-	key, source := ResolveProviderKey(provider, allowOAuth)
-	return Credential{Value: key, Source: source}
+// isOAuthMethod reports whether a method obtains its credential via an OAuth
+// login. This includes the interactive OAuth flows (OAuthMintKey/OAuthToken)
+// and bearer-style API-key methods, which carry an OAuth token shipped through
+// env/keychain (e.g. CLAUDE_CODE_OAUTH_TOKEN).
+func isOAuthMethod(m AuthMethod) bool {
+	if m.Kind == OAuthMintKey || m.Kind == OAuthToken {
+		return true
+	}
+	return m.Kind == APIKeyAuth && m.HeaderStyle == BearerHeader
+}
+
+// orderedAuthMethods returns a provider's auth methods reordered so the user's
+// preferred kind (api_key or oauth) is tried first. When no preference is
+// stored, the provider's declared method order (providers.json) is preserved.
+func orderedAuthMethods(provider string) []AuthMethod {
+	return reorderAuthMethods(AuthMethodsFor(provider), ProviderAuthDefault(provider))
+}
+
+// reorderAuthMethods is the pure core of orderedAuthMethods: it promotes the
+// methods matching the preferred kind ahead of the rest while keeping the
+// relative order within each group stable, so resolution still falls through to
+// the other method when the preferred one yields no value.
+func reorderAuthMethods(methods []AuthMethod, pref string) []AuthMethod {
+	if pref == "" || len(methods) < 2 {
+		return methods
+	}
+	preferOAuth := pref == AuthDefaultOAuth
+	preferred := make([]AuthMethod, 0, len(methods))
+	rest := make([]AuthMethod, 0, len(methods))
+	for _, m := range methods {
+		if isOAuthMethod(m) == preferOAuth {
+			preferred = append(preferred, m)
+		} else {
+			rest = append(rest, m)
+		}
+	}
+	return append(preferred, rest...)
+}
+
+// buildCredential assembles a Credential from a resolved value and its auth
+// method (header style, endpoint override, and any derived extra headers).
+func buildCredential(value string, src KeySource, m AuthMethod) Credential {
+	cred := Credential{Value: value, Source: src, HeaderStyle: m.HeaderStyle, BaseURL: m.BaseURL}
+	if m.Extra != nil {
+		cred.ExtraHeaders = m.Extra(value)
+	}
+	return cred
+}
+
+// resolveOAuthValue returns the stored access token / minted key for an OAuth
+// login id, optionally refreshing an expired token. Returns "" when no login is
+// stored or resolution fails (callers then fall through to the next method).
+func resolveOAuthValue(ctx context.Context, loginID string, refresh bool) string {
+	if loginID == "" {
+		return ""
+	}
+	st := auth.DefaultStorage()
+	if refresh {
+		tok, err := st.AccessTokenRefreshing(ctx, loginID)
+		if err != nil {
+			return ""
+		}
+		return tok
+	}
+	tok, _, ok := st.AccessToken(loginID)
+	if !ok {
+		return ""
+	}
+	return tok
+}
+
+// ResolveProviderKey returns the resolved credential value and source for a
+// provider. Thin wrapper over ResolveProviderCredential for callers that only
+// need the key string.
+func ResolveProviderKey(provider string) (key string, source KeySource) {
+	cred := ResolveProviderCredential(provider)
+	return cred.Value, cred.Source
 }
 
 // StoreProviderKey writes the API key for the given provider to the OS keychain.
@@ -161,14 +249,107 @@ func StoreProviderKey(provider, key string) error {
 }
 
 // DeleteProviderKey removes the API key for the given provider from the OS keychain.
+// It also clears any stored default-method marker so credential resolution falls
+// back to whatever credential remains.
 func DeleteProviderKey(provider string) error {
-	return keyring.Delete(keyringService, providerKeyringUser(provider))
+	err := keyring.Delete(keyringService, providerKeyringUser(provider))
+	_ = ClearProviderAuthDefault(provider)
+	return err
+}
+
+// providerAuthDefaultUser returns the keyring "user" field for a provider's
+// default-method marker, e.g. "anthropic" → "anthropic-auth-default".
+func providerAuthDefaultUser(provider string) string {
+	return provider + "-auth-default"
+}
+
+// ProviderAuthDefault returns the stored default-method preference for a
+// provider — AuthDefaultAPIKey, AuthDefaultOAuth, or "" when unset.
+func ProviderAuthDefault(provider string) string {
+	v, err := keyring.Get(keyringService, providerAuthDefaultUser(provider))
+	if err != nil {
+		return ""
+	}
+	return v
+}
+
+// SetProviderAuthDefault stores the default-method preference for a provider.
+func SetProviderAuthDefault(provider, kind string) error {
+	return keyring.Set(keyringService, providerAuthDefaultUser(provider), kind)
+}
+
+// ClearProviderAuthDefault removes a provider's default-method marker. A missing
+// marker is not an error.
+func ClearProviderAuthDefault(provider string) error {
+	err := keyring.Delete(keyringService, providerAuthDefaultUser(provider))
+	if errors.Is(err, keyring.ErrNotFound) {
+		return nil
+	}
+	return err
+}
+
+// ProviderAuthStatus summarizes a provider's stored credentials and which method
+// is the effective default. It is the single read the UI needs to render the
+// authentication panel without touching the keychain or auth subsystem directly.
+type ProviderAuthStatus struct {
+	APIKeyStored   bool
+	APIKeyPrefix   string // first 10 chars of the stored API key, for display
+	OAuthStored    bool
+	OAuthSupported bool   // provider has an OAuth login method
+	Default        string // AuthDefaultAPIKey | AuthDefaultOAuth (effective)
+}
+
+// GetProviderAuthStatus reports the stored-credential state and effective
+// default method for a provider. When no preference is stored, the default is
+// derived: API key if one exists, else OAuth if a token exists, else API key.
+func GetProviderAuthStatus(provider string) ProviderAuthStatus {
+	st := ProviderAuthStatus{}
+	if k, err := keyring.Get(keyringService, providerKeyringUser(provider)); err == nil && k != "" {
+		st.APIKeyStored = true
+		if len(k) > 10 {
+			st.APIKeyPrefix = k[:10]
+		} else {
+			st.APIKeyPrefix = k
+		}
+	}
+	if loginID := OAuthLoginID(provider); loginID != "" {
+		st.OAuthSupported = true
+		st.OAuthStored = auth.DefaultStorage().HasLogin(loginID)
+	}
+	switch ProviderAuthDefault(provider) {
+	case AuthDefaultOAuth:
+		st.Default = AuthDefaultOAuth
+	case AuthDefaultAPIKey:
+		st.Default = AuthDefaultAPIKey
+	default:
+		st.Default = effectiveDefault("", st.APIKeyStored, st.OAuthStored)
+	}
+	return st
+}
+
+// effectiveDefault derives the default auth method when there is no explicit
+// preference: API key if one is stored, else OAuth if a token is stored, else
+// API key. An explicit pref ("api_key"/"oauth") is returned verbatim.
+func effectiveDefault(pref string, apiKeyStored, oauthStored bool) string {
+	switch pref {
+	case AuthDefaultOAuth:
+		return AuthDefaultOAuth
+	case AuthDefaultAPIKey:
+		return AuthDefaultAPIKey
+	}
+	if apiKeyStored {
+		return AuthDefaultAPIKey
+	}
+	if oauthStored {
+		return AuthDefaultOAuth
+	}
+	return AuthDefaultAPIKey
 }
 
 // ListStoredProviderKeys returns the stored key info for all known providers.
 // The Prefix field holds the first 10 chars of the stored key (empty if not stored).
 func ListStoredProviderKeys() []ProviderKey {
-	providers := []string{"anthropic", "openai", "openrouter", "minimax", "mimo"}
+	providers := KnownProviders()
 	result := make([]ProviderKey, 0, len(providers))
 	for _, p := range providers {
 		pk := ProviderKey{Provider: p}

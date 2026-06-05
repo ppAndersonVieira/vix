@@ -21,7 +21,7 @@ func TestResolveProviderKey_EnvVarWins(t *testing.T) {
 	// Set env var — should take priority
 	t.Setenv("ANTHROPIC_API_KEY", "env-key")
 
-	key, source := ResolveProviderKey("anthropic", true)
+	key, source := ResolveProviderKey("anthropic")
 	if key != "env-key" {
 		t.Errorf("expected env-key, got %q", key)
 	}
@@ -38,7 +38,7 @@ func TestResolveProviderKey_KeychainFallback(t *testing.T) {
 	}
 	defer DeleteProviderKey("anthropic")
 
-	key, source := ResolveProviderKey("anthropic", true)
+	key, source := ResolveProviderKey("anthropic")
 	if key != "keychain-key" {
 		t.Errorf("expected keychain-key, got %q", key)
 	}
@@ -49,10 +49,11 @@ func TestResolveProviderKey_KeychainFallback(t *testing.T) {
 
 func TestResolveProviderKey_NoneWhenEmpty(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
 	// Ensure no keychain entry
 	DeleteProviderKey("anthropic")
 
-	key, source := ResolveProviderKey("anthropic", true)
+	key, source := ResolveProviderKey("anthropic")
 	if key != "" {
 		t.Errorf("expected empty key, got %q", key)
 	}
@@ -69,7 +70,7 @@ func TestStoreAndResolveRoundTrip(t *testing.T) {
 	}
 	defer DeleteProviderKey("anthropic")
 
-	key, source := ResolveProviderKey("anthropic", true)
+	key, source := ResolveProviderKey("anthropic")
 	if key != "roundtrip-key" || source != KeySourceKeychain {
 		t.Errorf("round-trip failed: key=%q source=%q", key, source)
 	}
@@ -77,13 +78,14 @@ func TestStoreAndResolveRoundTrip(t *testing.T) {
 
 func TestDeleteProviderKey(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
 
 	StoreProviderKey("anthropic", "delete-me")
 	if err := DeleteProviderKey("anthropic"); err != nil {
 		t.Fatalf("DeleteProviderKey: %v", err)
 	}
 
-	key, source := ResolveProviderKey("anthropic", true)
+	key, source := ResolveProviderKey("anthropic")
 	if key != "" || source != KeySourceNone {
 		t.Errorf("expected empty after delete, got key=%q source=%q", key, source)
 	}
@@ -93,7 +95,7 @@ func TestResolveProviderKey_OpenAI(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "openai-env-key")
 	defer t.Setenv("OPENAI_API_KEY", "")
 
-	key, source := ResolveProviderKey("openai", true)
+	key, source := ResolveProviderKey("openai")
 	if key != "openai-env-key" {
 		t.Errorf("expected openai-env-key, got %q", key)
 	}
@@ -102,43 +104,40 @@ func TestResolveProviderKey_OpenAI(t *testing.T) {
 	}
 }
 
-func TestResolveProviderKey_OAuthSkippedWhenDisallowed(t *testing.T) {
+func TestResolveProviderKey_OAuthFallback(t *testing.T) {
+	// With no API key, the Claude Code OAuth token method is the fallback and
+	// resolves with a Bearer-style source.
 	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token-value")
 	DeleteProviderKey("anthropic")
 
-	key, source := ResolveProviderKey("anthropic", false)
-	if key != "" {
-		t.Errorf("expected empty key, got %q", key)
+	cred := ResolveProviderCredential("anthropic")
+	if cred.Value != "oauth-token-value" {
+		t.Errorf("expected oauth-token-value, got %q", cred.Value)
 	}
-	if source != KeySourceNone {
-		t.Errorf("expected source %q, got %q", KeySourceNone, source)
+	if cred.Source != KeySourceOAuthToken {
+		t.Errorf("expected source %q, got %q", KeySourceOAuthToken, cred.Source)
+	}
+	if cred.HeaderStyle != BearerHeader {
+		t.Errorf("expected BearerHeader, got %q", cred.HeaderStyle)
 	}
 }
 
-func TestResolveProviderKey_OAuthUsedWhenAllowed(t *testing.T) {
-	t.Setenv("ANTHROPIC_API_KEY", "")
+func TestResolveProviderKey_APIKeyBeatsOAuthToken(t *testing.T) {
+	// The plain API key method is listed first, so it wins over the OAuth token.
+	t.Setenv("ANTHROPIC_API_KEY", "real-api-key")
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token-value")
-	DeleteProviderKey("anthropic")
+	defer t.Setenv("ANTHROPIC_API_KEY", "")
 
-	key, source := ResolveProviderKey("anthropic", true)
-	if key != "oauth-token-value" {
-		t.Errorf("expected oauth-token-value, got %q", key)
+	cred := ResolveProviderCredential("anthropic")
+	if cred.Value != "real-api-key" {
+		t.Errorf("expected real-api-key, got %q", cred.Value)
 	}
-	if source != KeySourceOAuthToken {
-		t.Errorf("expected source %q, got %q", KeySourceOAuthToken, source)
+	if cred.Source != KeySourceEnv {
+		t.Errorf("expected source %q, got %q", KeySourceEnv, cred.Source)
 	}
-}
-
-func TestResolveOAuthToken(t *testing.T) {
-	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "my-oauth-token")
-
-	key, source := ResolveOAuthToken()
-	if key != "my-oauth-token" {
-		t.Errorf("expected my-oauth-token, got %q", key)
-	}
-	if source != KeySourceOAuthToken {
-		t.Errorf("expected source %q, got %q", KeySourceOAuthToken, source)
+	if cred.HeaderStyle != APIKeyHeader {
+		t.Errorf("expected APIKeyHeader, got %q", cred.HeaderStyle)
 	}
 }
 
