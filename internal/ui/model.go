@@ -575,6 +575,18 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		}
 
+		// --- Tab switching (F1–F4), shared across all tabs/focus ---
+		switch msg.String() {
+		case "f1":
+			return m, m.switchTab(TabKindSessions)
+		case "f2":
+			return m, m.switchTab(TabKindChat)
+		case "f3":
+			return m, m.switchTab(TabKindModels)
+		case "f4":
+			return m, m.switchTab(TabKindSettings)
+		}
+
 		// --- Global workspace shortcuts ---
 		switch msg.String() {
 		case "ctrl+n":
@@ -582,7 +594,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selectedSession++
 				m.activeTab = TabKindChat
 				selSess := m.sessions[m.selectedSession]
-				selSess.unreadCount = 0
+				m.markSessionRead(selSess)
 				selSess.input.SetWidth(m.width - 4)
 				if selSess.client == nil && !selSess.reconnecting {
 					selSess.reconnecting = true
@@ -602,7 +614,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selectedSession--
 				m.activeTab = TabKindChat
 				selSess := m.sessions[m.selectedSession]
-				selSess.unreadCount = 0
+				m.markSessionRead(selSess)
 				selSess.input.SetWidth(m.width - 4)
 				if selSess.client == nil && !selSess.reconnecting {
 					selSess.reconnecting = true
@@ -648,7 +660,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selectedSession = idx
 					m.activeTab = TabKindChat
 					selSess := m.sessions[idx]
-					selSess.unreadCount = 0
+					m.markSessionRead(selSess)
 					selSess.input.SetWidth(m.width - 4)
 					if selSess.client == nil && !selSess.reconnecting {
 						selSess.reconnecting = true
@@ -695,17 +707,6 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.state = StateSessionCloseConfirm
 				}
 				return m, nil
-			case "f1":
-				return m, nil // already on Sessions tab
-			case "f2":
-				cmds = append(cmds, m.switchTab(TabKindChat))
-				return m, tea.Batch(cmds...)
-			case "f3":
-				cmds = append(cmds, m.switchTab(TabKindModels))
-				return m, tea.Batch(cmds...)
-			case "f4":
-				cmds = append(cmds, m.switchTab(TabKindSettings))
-				return m, tea.Batch(cmds...)
 			}
 		}
 
@@ -741,12 +742,6 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if settingsItem(m.settingsCursor) == settingCompactionThreshold {
 					m.adjustCompactionThreshold(0.05)
 				}
-			case "f1":
-				cmds = append(cmds, m.switchTab(TabKindSessions))
-			case "f2":
-				cmds = append(cmds, m.switchTab(TabKindChat))
-			case "f3":
-				cmds = append(cmds, m.switchTab(TabKindModels))
 			}
 			return m, tea.Batch(cmds...)
 		}
@@ -981,26 +976,6 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				sess.historyPanel.Open(len(sess.history.entries), m.height)
 			}
 			return m, nil
-
-		case "f1":
-			m.activeTab = TabKindSessions
-			m.syncSessionsSelected()
-			return m, tea.Batch(cmds...)
-
-		case "f2":
-			m.activeTab = TabKindChat
-			if sess := m.currentSession(); sess != nil {
-				sess.unreadCount = 0
-			}
-			return m, tea.Batch(cmds...)
-
-		case "f3":
-			cmds = append(cmds, m.switchTab(TabKindModels))
-			return m, tea.Batch(cmds...)
-
-		case "f4":
-			cmds = append(cmds, m.switchTab(TabKindSettings))
-			return m, tea.Batch(cmds...)
 
 		case "shift+tab":
 			if sess.agentState == StateWaitingForInput && len(sess.workflows) > 0 {
@@ -1363,6 +1338,27 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// hasUnreadSessions reports whether any session still has unread agent activity.
+func (m *Model) hasUnreadSessions() bool {
+	for _, s := range m.sessions {
+		if s.unreadCount > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// markSessionRead clears a session's unread counter and, once no session has
+// unread activity left, lowers the Sessions-tab highlight latch. This lets the
+// highlight clear when the last unread conversation is opened directly, without
+// having to visit the Sessions tab.
+func (m *Model) markSessionRead(sess *SessionState) {
+	sess.unreadCount = 0
+	if !m.hasUnreadSessions() {
+		m.sessionsTabUnseen = false
+	}
+}
+
 // switchTab changes the active tab and performs per-tab entry side effects,
 // returning any command to run (e.g. resuming the chat thinking animation).
 func (m *Model) switchTab(k TabKind) tea.Cmd {
@@ -1373,7 +1369,7 @@ func (m *Model) switchTab(k TabKind) tea.Cmd {
 		m.syncSessionsSelected()
 	case TabKindChat:
 		if sess := m.currentSession(); sess != nil {
-			sess.unreadCount = 0
+			m.markSessionRead(sess)
 			return sess.thinkingAnim.Resume()
 		}
 	case TabKindModels:
@@ -1536,21 +1532,6 @@ func (m Model) handleModelsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.modelsKeyInput, cmd = m.modelsKeyInput.Update(msg)
 			cmds = append(cmds, cmd)
 		}
-		return m, tea.Batch(cmds...)
-	}
-
-	// F-keys switch tabs regardless of focus.
-	switch msg.String() {
-	case "f1":
-		cmds = append(cmds, m.switchTab(TabKindSessions))
-		return m, tea.Batch(cmds...)
-	case "f2":
-		cmds = append(cmds, m.switchTab(TabKindChat))
-		return m, tea.Batch(cmds...)
-	case "f3":
-		return m, nil // already on Models tab
-	case "f4":
-		cmds = append(cmds, m.switchTab(TabKindSettings))
 		return m, tea.Batch(cmds...)
 	}
 
