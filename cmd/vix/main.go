@@ -20,6 +20,7 @@ import (
 	"github.com/get-vix/vix/internal/daemon"
 	"github.com/get-vix/vix/internal/daemon/brain"
 	"github.com/get-vix/vix/internal/headless"
+	"github.com/get-vix/vix/internal/protocol"
 	"github.com/get-vix/vix/internal/providers"
 	"github.com/get-vix/vix/internal/telemetry"
 
@@ -230,6 +231,16 @@ func main() {
 
 	var session *daemon.SessionClient
 
+	// restoreSessions holds the persisted open sessions (beyond the first,
+	// which becomes the initial client) that the TUI reopens on Init.
+	var restoreSessions []protocol.SessionSummary
+
+	// initialAttached is true when the initial session client resumed a
+	// persisted session (Attach) rather than starting fresh (Connect). The TUI
+	// uses it to show a "Restoring conversation…" placeholder until the replay
+	// arrives, instead of flashing the welcome screen.
+	var initialAttached bool
+
 	var daemonCmd *exec.Cmd
 
 	// Load the socket auth token (if -auth-token-path was given) once,
@@ -275,9 +286,25 @@ func main() {
 		if client.Ping() {
 			session = daemon.NewSessionClient(cfg.SocketPath)
 			session.SetAuthToken(authToken)
-			if err := session.Connect(cfg.CWD, cfg.ConfigDir, cfg.Model, cfg.ForceInit, !*disableWritePermission, !*disableDirAccess, *prompt != ""); err != nil {
-				fmt.Fprintf(os.Stderr, "Error connecting to daemon: %v\n", err)
-				os.Exit(1)
+
+			// TUI mode: reopen previously-open sessions for this cwd. The first
+			// open session becomes the initial client; the rest are attached by
+			// the TUI on Init. Headless mode (prompt set) always starts fresh.
+			attached := false
+			if *prompt == "" {
+				if sums, err := client.ListSessions(cfg.CWD, cfg.ConfigDir); err == nil && len(sums) > 0 {
+					if err := session.Attach(cfg.CWD, cfg.ConfigDir, cfg.Model, cfg.ForceInit, !*disableWritePermission, !*disableDirAccess, false, sums[0].ID); err == nil {
+						restoreSessions = sums[1:]
+						attached = true
+						initialAttached = true
+					}
+				}
+			}
+			if !attached {
+				if err := session.Connect(cfg.CWD, cfg.ConfigDir, cfg.Model, cfg.ForceInit, !*disableWritePermission, !*disableDirAccess, *prompt != ""); err != nil {
+					fmt.Fprintf(os.Stderr, "Error connecting to daemon: %v\n", err)
+					os.Exit(1)
+				}
 			}
 			defer session.SendClose()
 		}
@@ -316,6 +343,8 @@ func main() {
 	ui.ApplyTheme(config.LoadThemeConfig(cfg.Paths))
 
 	model := ui.NewModel(cfg, session, *testMode, authToken, !*disableWritePermission, !*disableDirAccess)
+	model.SetRestoreSessions(restoreSessions)
+	model.SetInitialAwaitingReplay(initialAttached)
 
 	p := tea.NewProgram(model)
 	ui.SetProgram(p)

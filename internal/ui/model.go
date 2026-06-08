@@ -2,6 +2,7 @@ package ui
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"os"
@@ -56,6 +57,14 @@ type reconnectSuccessMsg struct {
 
 // reconnectFailedMsg is sent when reconnection fails.
 type reconnectFailedMsg struct {
+	daemonSessionID string
+}
+
+// sessionOrphanedMsg is sent when an attach reconnect reports the session no
+// longer exists on disk (lost in a daemon restart before its first flush). The
+// session can't be continued; the handler orphans it and tells the user to
+// /copy the conversation.
+type sessionOrphanedMsg struct {
 	daemonSessionID string
 }
 
@@ -132,11 +141,57 @@ func attemptReconnect(socketPath, cwd, configDir, model, authToken string, force
 		}
 		session := daemon.NewSessionClient(socketPath)
 		session.SetAuthToken(authToken)
-		if err := session.Connect(cwd, configDir, model, forceInit, enableWrite, enableDir, false); err != nil {
+		// A session that has connected before is resumed by ID (attach), so a
+		// restarted daemon rebuilds it from disk. An empty target ID is a
+		// brand-new session that has never connected — start it fresh.
+		var err error
+		if targetDaemonSessionID == "" {
+			err = session.Connect(cwd, configDir, model, forceInit, enableWrite, enableDir, false)
+		} else {
+			err = session.Attach(cwd, configDir, model, forceInit, enableWrite, enableDir, false, targetDaemonSessionID)
+			if errors.Is(err, daemon.ErrSessionNotFound) {
+				// The daemon restarted and lost this session before it was
+				// flushed. It can't be continued; orphan it (offer /copy).
+				return sessionOrphanedMsg{daemonSessionID: targetDaemonSessionID}
+			}
+		}
+		if err != nil {
 			time.Sleep(2 * time.Second)
 			return reconnectFailedMsg{daemonSessionID: targetDaemonSessionID}
 		}
 		return reconnectSuccessMsg{daemonSessionID: targetDaemonSessionID, client: session}
+	}
+}
+
+// sessionRestoredMsg is sent when a persisted open session is successfully
+// re-attached on launch. The handler adds a new SessionState for it.
+type sessionRestoredMsg struct {
+	summary protocol.SessionSummary
+	client  *daemon.SessionClient
+}
+
+// sessionRestoreFailedMsg is sent when reopening a persisted session fails (the
+// daemon is gone or the record vanished). The session is simply not restored.
+type sessionRestoreFailedMsg struct {
+	id string
+}
+
+// attachRestoreSession reopens a persisted session on launch by attaching to it
+// by ID. Used for the open sessions beyond the first (which main attaches as the
+// initial client).
+func attachRestoreSession(socketPath, cwd, configDir, model, authToken string, enableWrite, enableDir bool, summary protocol.SessionSummary) tea.Cmd {
+	return func() tea.Msg {
+		client := daemon.NewClient(socketPath)
+		client.SetAuthToken(authToken)
+		if !client.Ping() {
+			return sessionRestoreFailedMsg{id: summary.ID}
+		}
+		sc := daemon.NewSessionClient(socketPath)
+		sc.SetAuthToken(authToken)
+		if err := sc.Attach(cwd, configDir, model, false, enableWrite, enableDir, false, summary.ID); err != nil {
+			return sessionRestoreFailedMsg{id: summary.ID}
+		}
+		return sessionRestoredMsg{summary: summary, client: sc}
 	}
 }
 
@@ -283,6 +338,27 @@ type Model struct {
 	kittySupported bool
 	cfg            *config.Config
 	testMode       bool
+
+	// restoreSessions holds persisted open sessions (beyond the first, which is
+	// the initial client) to reopen on Init.
+	restoreSessions []protocol.SessionSummary
+}
+
+// SetRestoreSessions records the persisted open sessions the TUI should reopen
+// on launch (attached lazily from Init). Called once by main before the program
+// starts.
+func (m *Model) SetRestoreSessions(s []protocol.SessionSummary) {
+	m.restoreSessions = s
+}
+
+// SetInitialAwaitingReplay marks the initial session as one that was attached
+// (restored) on launch and is still waiting for its event.replay. While true the
+// chat area shows a "Restoring conversation…" placeholder instead of the welcome
+// screen. Called once by main before the program starts.
+func (m *Model) SetInitialAwaitingReplay(awaiting bool) {
+	if awaiting && len(m.sessions) > 0 {
+		m.sessions[0].awaitingReplay = true
+	}
 }
 
 // currentSession returns the selected session, or nil if there is none.
@@ -332,6 +408,15 @@ func (m Model) Init() tea.Cmd {
 	cmds = append(cmds, func() tea.Msg { return startCursorBlinkMsg{} })
 	if sess := m.currentSession(); sess != nil && sess.client != nil {
 		cmds = append(cmds, startSessionEventLoop(sess.client))
+		// A restored initial session shows the "Restoring conversation…"
+		// placeholder until its replay arrives; animate its spinner.
+		if sess.awaitingReplay {
+			cmds = append(cmds, sess.thinkingAnim.Start())
+		}
+	}
+	// Reopen any persisted open sessions beyond the initial one.
+	for _, sum := range m.restoreSessions {
+		cmds = append(cmds, attachRestoreSession(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, sum))
 	}
 	cmds = append(cmds, waitForResume, tea.RequestBackgroundColor)
 	return tea.Batch(cmds...)
@@ -1044,6 +1129,10 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if sess != nil {
 			sess.reconnecting = true
 			sess.pendingInput = nil
+			// If the connection dropped before the replay arrived, abandon the
+			// restoring placeholder so we don't spin forever.
+			sess.awaitingReplay = false
+			sess.thinkingAnim.Stop()
 			sess.chatMessages = append(sess.chatMessages, renderErrorMessage(fmt.Errorf("daemon connection lost")))
 			if sess.agentState != StatePlanReview {
 				sess.agentState = StateWaitingForInput
@@ -1091,6 +1180,44 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if sess != nil && sess.reconnecting {
 			return m, attemptReconnect(m.socketPath, m.cwd, m.cfg.ConfigDir, m.cfg.Model, m.authToken, m.forceInit, m.enableAutomaticWritePermission, m.enableAutomaticDirectoryAccess, msg.daemonSessionID)
 		}
+		return m, nil
+
+	case sessionOrphanedMsg:
+		_, sess := m.findSessionByDaemonID(msg.daemonSessionID)
+		if sess == nil {
+			return m, nil
+		}
+		sess.reconnecting = false
+		sess.orphaned = true
+		sess.awaitingReplay = false
+		sess.client = nil
+		sess.pendingInput = nil
+		sess.pendingPlanAction = nil
+		sess.agentState = StateWaitingForInput
+		sess.thinkingAnim.Stop()
+		sess.chatMessages = append(sess.chatMessages, renderErrorMessage(fmt.Errorf("This conversation was lost when the daemon restarted and can't be continued. Use /copy to save it before it's gone.")))
+		return m, nil
+
+	case sessionRestoredMsg:
+		// A persisted open session was re-attached on launch. Add it as a new
+		// session; its viewport is rebuilt from the daemon's event.replay.
+		if _, existing := m.findSessionByDaemonID(msg.summary.ID); existing != nil {
+			msg.client.Close()
+			return m, nil
+		}
+		restored := newSessionState(m.cfg, msg.client)
+		if msg.summary.Model != "" {
+			restored.setModel(msg.summary.Model)
+		}
+		// Restored sessions are waiting for their replay; show the placeholder
+		// (with an animated spinner) until it arrives.
+		restored.awaitingReplay = true
+		m.sessions = append(m.sessions, restored)
+		return m, tea.Batch(startSessionEventLoop(msg.client), restored.thinkingAnim.Start())
+
+	case sessionRestoreFailedMsg:
+		// Best-effort: a persisted session could not be reopened. Leave it on
+		// disk; it will be offered again on the next launch.
 		return m, nil
 
 	case tea.PasteMsg:
@@ -1781,6 +1908,14 @@ func (m Model) handleEnter(sess *SessionState) (tea.Model, tea.Cmd) {
 			return model, cmd
 		}
 
+		// Orphaned sessions have no daemon-side history and can't be continued.
+		// Local commands above (e.g. /copy) still work; anything else is refused
+		// with a reminder rather than spinning forever with no daemon.
+		if sess.orphaned {
+			sess.chatMessages = append(sess.chatMessages, renderSystemMessage("This conversation can't be continued. Use /copy to save it.", m.styles))
+			return m, nil
+		}
+
 		if text != "" {
 			sess.history.Save(text)
 		}
@@ -1824,6 +1959,16 @@ func (m *Model) applyEventToSession(idx int, event protocol.SessionEvent) []tea.
 		json.Unmarshal(data, &started)
 		sess.parentID = started.ParentID
 		sess.forkTurnIdx = started.ForkTurnIdx
+
+	case "event.replay":
+		data := marshalData(event.Data)
+		var rep protocol.EventReplay
+		json.Unmarshal(data, &rep)
+		m.applyReplay(sess, rep)
+		// The viewport is now rebuilt; drop the restoring placeholder and stop
+		// its spinner.
+		sess.awaitingReplay = false
+		sess.thinkingAnim.Stop()
 
 	case "event.init_state":
 		data := marshalData(event.Data)
@@ -2220,7 +2365,11 @@ func (m Model) View() tea.View {
 			}
 		}
 		if chatContent == "" && !m.testMode {
-			chatContent = renderWelcomeInline(innerWidth, layout.ChatHeight-1, m.styles)
+			if sess != nil && sess.awaitingReplay {
+				chatContent = renderRestoringInline(innerWidth, layout.ChatHeight-1, m.styles, sess.thinkingAnim.View())
+			} else {
+				chatContent = renderWelcomeInline(innerWidth, layout.ChatHeight-1, m.styles)
+			}
 		}
 
 		contentHeight := layout.ChatHeight - 1
@@ -2565,6 +2714,69 @@ func (m *Model) flushSessionBuf(sess *SessionState) {
 	sess.assistantRendered = ""
 	sess.thinkingBuf = ""
 	sess.thinkingRendered = ""
+}
+
+// applyReplay rebuilds a session's viewport and restores its mode/model/todos
+// from a daemon event.replay (sent when attaching to a persisted session).
+// Restore-time warnings are appended as system messages.
+func (m *Model) applyReplay(sess *SessionState, rep protocol.EventReplay) {
+	sess.chatMessages = m.buildReplayChatMessages(rep)
+	sess.todos = rep.Todos
+	sess.activePlan = rep.ActivePlan
+	if rep.Model != "" {
+		sess.setModel(rep.Model)
+	}
+	sess.activeWorkflow = rep.ActiveWorkflow
+	for _, w := range rep.Warnings {
+		sess.chatMessages = append(sess.chatMessages, renderSystemMessage(w, m.styles))
+	}
+	if sess.agentState == StateStreaming || sess.agentState == StateToolExecuting {
+		sess.agentState = StateWaitingForInput
+	}
+}
+
+// buildReplayChatMessages reconstructs rendered ChatMessages from a replayed
+// conversation. Tool results are matched to their preceding tool_use by ID so
+// the result line carries the right tool name.
+func (m *Model) buildReplayChatMessages(rep protocol.EventReplay) []ChatMessage {
+	var out []ChatMessage
+	toolNames := map[string]string{}
+	for _, msg := range rep.Messages {
+		for _, b := range msg.Blocks {
+			switch b.Kind {
+			case "text":
+				if msg.Role == "user" {
+					out = append(out, renderUserMessage(b.Text, m.width))
+				} else {
+					out = append(out, renderAssistantMessage(b.Text, m.mdRenderer))
+				}
+			case "tool_use":
+				if b.ToolID != "" {
+					toolNames[b.ToolID] = b.ToolName
+				}
+				out = append(out, renderToolCall(b.ToolName, replayToolSummary(b.Input), "", [4]string{}, m.styles))
+			case "tool_result":
+				name := toolNames[b.ToolID]
+				out = append(out, renderToolResultWithContext(name, b.Output, b.IsError, false, "", m.styles, m.mdRenderer, m.mdRenderer.width))
+			}
+		}
+	}
+	return out
+}
+
+// replayToolSummary derives a short one-line summary from a tool's input for
+// the replayed tool-call line (the live summary is computed daemon-side and not
+// persisted).
+func replayToolSummary(input map[string]any) string {
+	if input == nil {
+		return ""
+	}
+	for _, k := range []string{"path", "command", "pattern", "query", "url", "name", "id"} {
+		if v, ok := input[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // visualLineCount returns the display line count for the current session's input.

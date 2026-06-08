@@ -135,6 +135,16 @@ type Session struct {
 	totalCacheWrite   int64
 	totalAPIWaitMs    int64
 	sessionMode       string // "chat" or "workflow"
+	activeWorkflow    string // name of the active workflow when sessionMode=="workflow"
+
+	// Persistence/attach state.
+	// attachRecord is non-nil when this session is resuming a persisted record;
+	// Run() emits event.replay (with restore validation) after initBrain.
+	attachRecord *sessionRecord
+	// closedByUser is set when a session.close command is received (the TUI "x"
+	// action), distinguishing an explicit close (move record open->closed) from
+	// a bare disconnect (record stays open for next-run reopen).
+	closedByUser bool
 }
 
 // NewSession creates a new agent session.
@@ -530,6 +540,10 @@ func (s *Session) Run() {
 
 	s.initBrain()
 
+	// Attached (resumed) session: rebuild the client's viewport and apply
+	// restore-time validation now that the model and workflows are resolved.
+	s.emitReplay()
+
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -573,12 +587,15 @@ func (s *Session) Run() {
 					if err := WriteChatAgentModel(s.paths, s.chatAgent, spec); err != nil {
 						log.Printf("[session] WARN: failed to persist model choice to %s.md: %v", s.chatAgent, err)
 					}
+					s.persist()
 				}
 			case "session.trim":
 				var data protocol.SessionTrimData
 				json.Unmarshal(cmd.Data, &data)
 				s.trimHistory(data.TurnIdx)
+				s.persist()
 			case "session.close":
+				s.closedByUser = true
 				return
 			}
 		}
@@ -1749,6 +1766,7 @@ func (s *Session) handleInput(text string, attachments []protocol.Attachment) {
 	copy(snapshot, s.messages)
 	s.turnSnapshots = append(s.turnSnapshots, snapshot)
 	s.mu.Unlock()
+	s.persist()
 	s.emit("event.agent_done", nil)
 }
 
@@ -2394,6 +2412,8 @@ func (s *Session) handleWorkflowCommand(name, text string) {
 	}
 
 	s.sessionMode = "workflow"
+	s.activeWorkflow = name
+	s.persist()
 
 	planCtx, planCancel := context.WithCancel(s.ctx)
 	s.planCancel = planCancel

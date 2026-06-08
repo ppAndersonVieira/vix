@@ -7,13 +7,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/get-vix/vix/internal/config"
+	"github.com/get-vix/vix/internal/protocol"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
-	"github.com/get-vix/vix/internal/config"
-	"github.com/get-vix/vix/internal/protocol"
 )
 
 // HandlerFunc is the type for daemon request handlers.
@@ -43,9 +43,9 @@ type Server struct {
 	cred         config.Credential
 	model        string
 	pluginConfig PluginConfig
-	sessions  map[string]*Session
-	sessionMu sync.Mutex
-	serverCtx context.Context
+	sessions     map[string]*Session
+	sessionMu    sync.Mutex
+	serverCtx    context.Context
 
 	// User-level config directory (~/.vix/)
 	homeVixDir string
@@ -61,8 +61,8 @@ type Server struct {
 	authToken string
 
 	// Web UI pub/sub
-	subscribers   []chan struct{}
-	subscriberMu  sync.Mutex
+	subscribers  []chan struct{}
+	subscriberMu sync.Mutex
 }
 
 // NewServer creates a new daemon server.
@@ -261,8 +261,39 @@ func (s *Server) handleSession(conn net.Conn, scanner *bufio.Scanner, startCmd p
 	// unconfigured state rather than fabricating a doomed client.
 	var llmClient LLM
 
+	// Attach: resume a persisted session by ID instead of minting a new one.
+	// Load the record up front so we can reuse its ID and seed history; a
+	// missing record is reported with a machine-readable code so the client can
+	// orphan the session (offer /copy) rather than retry forever.
+	var attachRec *sessionRecord
+	if startData.AttachSessionID != "" {
+		p := config.NewVixPaths(startData.ConfigDir, s.homeVixDir, cwd)
+		rec, found, err := loadSessionRecord(p, startData.AttachSessionID)
+		if err != nil {
+			LogError("attach: failed to load session %s: %v", startData.AttachSessionID, err)
+		}
+		if !found {
+			s.writeEvent(conn, protocol.SessionEvent{
+				Type: "event.error",
+				Data: protocol.EventError{
+					Message: "session not found",
+					Code:    "session_not_found",
+				},
+			})
+			return
+		}
+		attachRec = &rec
+	}
+
 	sessionID := generateSessionID()
+	if attachRec != nil {
+		sessionID = attachRec.ID
+	}
 	session := NewSession(sessionID, s, llmClient, model, cwd, startData.ConfigDir, startData.ForceInit, startData.EnableAutomaticWritePermission, startData.EnableAutomaticDirectoryAccess, startData.Headless, s.serverCtx)
+
+	if attachRec != nil {
+		session.seedFromRecord(attachRec)
+	}
 
 	// Seed conversation history from a forked session if requested.
 	// Must be done before session.Run() starts processing commands.
@@ -298,6 +329,11 @@ func (s *Server) handleSession(conn net.Conn, scanner *bufio.Scanner, startCmd p
 	s.sessions[sessionID] = session
 	s.sessionMu.Unlock()
 	s.notifySubscribers()
+
+	// Persist the freshly-created (or attached) session to open/ so it survives
+	// a crash and is reopened on next launch. Attached sessions are already on
+	// disk; this is a no-op-equivalent rewrite. Skipped when persistence is off.
+	session.persist()
 
 	LogInfo("Session %s started (cwd=%s, model=%s)", sessionID, cwd, model)
 
@@ -425,7 +461,6 @@ func (s *Server) handleSession(conn net.Conn, scanner *bufio.Scanner, startCmd p
 	// Run the agent loop (blocking)
 	session.Run()
 
-
 	// Wait for reader/writer to finish
 	session.cancel()
 	<-readerDone
@@ -448,6 +483,15 @@ func (s *Server) handleSession(conn net.Conn, scanner *bufio.Scanner, startCmd p
 	delete(s.sessions, sessionID)
 	s.sessionMu.Unlock()
 	s.notifySubscribers()
+
+	// An explicit user close (the "x" action sends session.close) moves the
+	// record open/ -> closed/ so it is not reopened on next launch. A bare
+	// disconnect leaves it in open/ so the TUI restores it next run.
+	if session.closedByUser {
+		if err := moveSessionToClosed(session.paths, sessionID); err != nil {
+			LogError("close session %s: move to closed failed: %v", sessionID, err)
+		}
+	}
 
 	LogInfo("Session %s ended (run returned, reader done, writer done)", sessionID)
 }

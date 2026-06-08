@@ -108,6 +108,19 @@ type SessionState struct {
 	// Fork lineage (zero values for root sessions)
 	parentID    string
 	forkTurnIdx int
+
+	// orphaned is set when a reconnect attach reported the session no longer
+	// exists on disk (e.g. lost in a daemon restart before its first flush).
+	// The conversation can't be continued; input is disabled and the user is
+	// told to /copy it before it's gone.
+	orphaned bool
+
+	// awaitingReplay is set for a session that was attached (restored) on launch
+	// and is still waiting for its event.replay to rebuild the viewport. While
+	// true the chat area shows a "Restoring conversation…" placeholder instead
+	// of the welcome screen, so a restored conversation doesn't flash the
+	// welcome view before its history arrives.
+	awaitingReplay bool
 }
 
 // newSessionState initialises a fresh session state ready for a new agent session.

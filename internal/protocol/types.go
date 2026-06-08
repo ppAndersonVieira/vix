@@ -44,6 +44,24 @@ type SessionStartData struct {
 	// the turn at ForkTurnIdx (0-based).
 	ForkSessionID string `json:"fork_session_id,omitempty"`
 	ForkTurnIdx   int    `json:"fork_turn_idx,omitempty"`
+	// AttachSessionID, when non-empty, asks the daemon to resume a persisted
+	// session by ID instead of creating a fresh one: it loads the on-disk
+	// record (open/ or closed/), reuses that ID, and replays the conversation
+	// to the client via event.replay. If no record exists the daemon answers
+	// with event.error carrying Code "session_not_found".
+	AttachSessionID string `json:"attach_session_id,omitempty"`
+}
+
+// SessionSummary is the lightweight projection of a persisted session returned
+// by the session.list RPC. It carries just enough to populate the Sessions
+// list without loading full conversation histories.
+type SessionSummary struct {
+	ID            string `json:"id"`
+	CWD           string `json:"cwd"`
+	Model         string `json:"model"`
+	FirstMessage  string `json:"first_message,omitempty"`
+	StartedAt     string `json:"started_at,omitempty"`      // RFC3339
+	LastRequestAt string `json:"last_request_at,omitempty"` // RFC3339
 }
 
 // SessionInputData carries user chat input.
@@ -259,6 +277,48 @@ type EventUserQuestion struct {
 // EventError carries an error message.
 type EventError struct {
 	Message string `json:"message"`
+	// Code is an optional machine-readable discriminator. Currently used by
+	// the attach flow: "session_not_found" tells the client a resume target no
+	// longer exists on disk so it can orphan the session (offer /copy) instead
+	// of retrying the reconnect forever.
+	Code string `json:"code,omitempty"`
+}
+
+// --- Session restore / replay (attach) ---
+
+// ReplayBlock is one content block of a replayed conversation turn, projected
+// into a wire-stable shape owned by this package (so neither protocol nor the
+// TUI needs to import the daemon's llm types).
+type ReplayBlock struct {
+	Kind     string         `json:"kind"` // "text" | "thinking" | "tool_use" | "tool_result"
+	Text     string         `json:"text,omitempty"`
+	ToolID   string         `json:"tool_id,omitempty"`
+	ToolName string         `json:"tool_name,omitempty"`
+	Input    map[string]any `json:"input,omitempty"`
+	Output   string         `json:"output,omitempty"`
+	IsError  bool           `json:"is_error,omitempty"`
+}
+
+// ReplayMessage is one turn of a replayed conversation.
+type ReplayMessage struct {
+	Role   string        `json:"role"` // "user" | "assistant"
+	Blocks []ReplayBlock `json:"blocks"`
+}
+
+// EventReplay is emitted once, immediately after event.session_started, when a
+// client attaches to a persisted session. It rebuilds the chat viewport and
+// restores the session's mode/model/todos, plus any restore-time warnings
+// (model changed, workflow missing, etc.).
+type EventReplay struct {
+	Messages       []ReplayMessage `json:"messages"`
+	Todos          []TodoItem      `json:"todos,omitempty"`
+	ActivePlan     *Plan           `json:"active_plan,omitempty"`
+	Model          string          `json:"model,omitempty"`
+	SessionMode    string          `json:"session_mode,omitempty"`
+	ActiveWorkflow string          `json:"active_workflow,omitempty"`
+	// Warnings are human-readable restore notices rendered into the viewport
+	// (e.g. "Saved with model X; switched to your current default Y.").
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // EventRetry notifies the UI about an API retry attempt.

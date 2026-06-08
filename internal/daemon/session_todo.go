@@ -50,6 +50,7 @@ func (s *Session) handleTodoWrite(ctx context.Context, input map[string]any) (st
 	emitCopy := make([]protocol.TodoItem, len(snapshot))
 	copy(emitCopy, snapshot)
 	s.emit("event.todo_list_updated", protocol.EventTodoListUpdated{Todos: emitCopy})
+	s.persist()
 
 	return "TODO list updated.\n" + formatTodoList(snapshot), false
 }

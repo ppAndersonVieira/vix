@@ -1,0 +1,398 @@
+package daemon
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/get-vix/vix/internal/config"
+	"github.com/get-vix/vix/internal/daemon/llm"
+	"github.com/get-vix/vix/internal/protocol"
+)
+
+// sessionRecordSchemaVersion is the on-disk format version. Bump it when the
+// shape of sessionRecord changes incompatibly so loaders can migrate or skip.
+const sessionRecordSchemaVersion = 1
+
+// sessionRecord is the persisted, serialization-stable representation of a
+// session. It is written under ~/.vix/sessions/{open,closed}/<id>.json (or the
+// override dir's sessions/ in config-dir mode). It carries enough to both
+// continue the conversation (messages, model, cwd, mode) and redisplay it in a
+// freshly launched TUI (via replay), plus UI/telemetry niceties.
+type sessionRecord struct {
+	SchemaVersion int    `json:"schema_version"`
+	ID            string `json:"id"`
+	CWD           string `json:"cwd"`
+	Model         string `json:"model"`
+	ParentID      string `json:"parent_id,omitempty"`
+	ForkTurnIdx   int    `json:"fork_turn_idx,omitempty"`
+
+	SessionMode    string `json:"session_mode"`
+	ActiveWorkflow string `json:"active_workflow,omitempty"`
+
+	Messages   []llm.MessageParam  `json:"messages"`
+	TodoList   []protocol.TodoItem `json:"todo_list,omitempty"`
+	ActivePlan *protocol.Plan      `json:"active_plan,omitempty"`
+
+	StartedAt     time.Time `json:"started_at"`
+	LastRequestAt time.Time `json:"last_request_at,omitempty"`
+
+	TotalInputTokens  int64 `json:"total_input_tokens,omitempty"`
+	TotalOutputTokens int64 `json:"total_output_tokens,omitempty"`
+	TotalCacheRead    int64 `json:"total_cache_read,omitempty"`
+	TotalCacheWrite   int64 `json:"total_cache_write,omitempty"`
+}
+
+// sessionRecordPath returns the path of a record within dir, or "" when dir is
+// empty (persistence disabled because no home/override directory is available).
+func sessionRecordPath(dir, id string) string {
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, id+".json")
+}
+
+// saveSessionRecord atomically writes rec to the open/ directory. A no-op (nil)
+// when persistence is disabled (Sessions() empty). The write goes to a unique
+// temp file in the same directory, then renames over the target so a crash mid
+// write never leaves a truncated record.
+func saveSessionRecord(paths config.VixPaths, rec sessionRecord) error {
+	dir := paths.SessionsOpen()
+	if dir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	rec.SchemaVersion = sessionRecordSchemaVersion
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, rec.ID+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, sessionRecordPath(dir, rec.ID))
+}
+
+// loadSessionRecord reads the record for id, checking the open/ directory first
+// and then closed/. The bool reports whether a record was found.
+func loadSessionRecord(paths config.VixPaths, id string) (sessionRecord, bool, error) {
+	for _, dir := range []string{paths.SessionsOpen(), paths.SessionsClosed()} {
+		p := sessionRecordPath(dir, id)
+		if p == "" {
+			continue
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return sessionRecord{}, false, err
+		}
+		var rec sessionRecord
+		if err := json.Unmarshal(data, &rec); err != nil {
+			return sessionRecord{}, false, err
+		}
+		return rec, true, nil
+	}
+	return sessionRecord{}, false, nil
+}
+
+// listOpenSessionRecords returns every parseable record in the open/ directory.
+// Unreadable/corrupt files are skipped rather than failing the whole listing.
+func listOpenSessionRecords(paths config.VixPaths) []sessionRecord {
+	dir := paths.SessionsOpen()
+	if dir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []sessionRecord
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var rec sessionRecord
+		if err := json.Unmarshal(data, &rec); err != nil {
+			continue
+		}
+		out = append(out, rec)
+	}
+	// Most-recently-active first so the TUI restores in a sensible order.
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].lastActivity().After(out[j].lastActivity())
+	})
+	return out
+}
+
+// moveSessionToClosed moves a record from open/ to closed/. It is invoked on an
+// explicit user close (the "x" action), never on a bare disconnect. A no-op
+// when persistence is disabled or the open record does not exist.
+func moveSessionToClosed(paths config.VixPaths, id string) error {
+	src := sessionRecordPath(paths.SessionsOpen(), id)
+	dst := sessionRecordPath(paths.SessionsClosed(), id)
+	if src == "" || dst == "" {
+		return nil
+	}
+	if _, err := os.Stat(src); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	return os.Rename(src, dst)
+}
+
+// lastActivity returns the timestamp used to order the open list: the last
+// request time if present, else the start time.
+func (r sessionRecord) lastActivity() time.Time {
+	if !r.LastRequestAt.IsZero() {
+		return r.LastRequestAt
+	}
+	return r.StartedAt
+}
+
+// firstUserMessage returns a short single-line preview of the first user text
+// block, used for the Sessions list "first message" column.
+func (r sessionRecord) firstUserMessage() string {
+	for _, m := range r.Messages {
+		if m.Role != llm.RoleUser {
+			continue
+		}
+		for _, b := range m.Content {
+			if b.Type == llm.BlockText && strings.TrimSpace(b.Text) != "" {
+				return firstLine(b.Text)
+			}
+		}
+	}
+	return ""
+}
+
+// firstLine trims s to its first non-empty line, capped at 120 runes.
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	r := []rune(s)
+	if len(r) > 120 {
+		return string(r[:120]) + "…"
+	}
+	return s
+}
+
+// summary projects a record into the lightweight shape sent to the TUI for the
+// session.list response.
+func (r sessionRecord) summary() protocol.SessionSummary {
+	s := protocol.SessionSummary{
+		ID:           r.ID,
+		CWD:          r.CWD,
+		Model:        r.Model,
+		FirstMessage: r.firstUserMessage(),
+	}
+	if !r.StartedAt.IsZero() {
+		s.StartedAt = r.StartedAt.Format(time.RFC3339)
+	}
+	if !r.LastRequestAt.IsZero() {
+		s.LastRequestAt = r.LastRequestAt.Format(time.RFC3339)
+	}
+	return s
+}
+
+// buildRecord snapshots the session's current state into a serializable record.
+// Each piece is read under the lock that guards it.
+func (s *Session) buildRecord() sessionRecord {
+	s.mu.Lock()
+	msgs := make([]llm.MessageParam, len(s.messages))
+	copy(msgs, s.messages)
+	plan := s.activePlan
+	s.mu.Unlock()
+
+	s.todoMu.RLock()
+	todos := make([]protocol.TodoItem, len(s.todoList))
+	copy(todos, s.todoList)
+	s.todoMu.RUnlock()
+
+	return sessionRecord{
+		ID:                s.id,
+		CWD:               s.cwd,
+		Model:             s.model,
+		ParentID:          s.parentID,
+		ForkTurnIdx:       s.forkTurnIdx,
+		SessionMode:       s.sessionMode,
+		ActiveWorkflow:    s.activeWorkflow,
+		Messages:          msgs,
+		TodoList:          todos,
+		ActivePlan:        plan,
+		StartedAt:         s.startTime,
+		LastRequestAt:     s.lastRequestAt,
+		TotalInputTokens:  s.totalInputTokens,
+		TotalOutputTokens: s.totalOutputTokens,
+		TotalCacheRead:    s.totalCacheRead,
+		TotalCacheWrite:   s.totalCacheWrite,
+	}
+}
+
+// persist writes the session's current state to the open/ directory. Best
+// effort: failures are logged, never surfaced to the user. No-op when
+// persistence is disabled (no home/override dir) or the session was closed by
+// the user (its record now lives in closed/ and must not be resurrected).
+func (s *Session) persist() {
+	if s.paths.SessionsOpen() == "" || s.closedByUser {
+		return
+	}
+	if err := saveSessionRecord(s.paths, s.buildRecord()); err != nil {
+		LogError("persist session %s: %v", s.id, err)
+	}
+}
+
+// seedFromRecord restores conversation state from a persisted record onto a
+// freshly constructed session (used by the attach path). It does NOT restore
+// the model — attach deliberately resumes on the current default and warns on
+// mismatch in emitReplay.
+func (s *Session) seedFromRecord(rec *sessionRecord) {
+	s.messages = append([]llm.MessageParam(nil), rec.Messages...)
+	s.todoList = append([]protocol.TodoItem(nil), rec.TodoList...)
+	s.activePlan = rec.ActivePlan
+	s.parentID = rec.ParentID
+	s.forkTurnIdx = rec.ForkTurnIdx
+	s.sessionMode = rec.SessionMode
+	if s.sessionMode == "" {
+		s.sessionMode = "chat"
+	}
+	s.activeWorkflow = rec.ActiveWorkflow
+	if !rec.StartedAt.IsZero() {
+		s.startTime = rec.StartedAt
+	}
+	s.lastRequestAt = rec.LastRequestAt
+	s.totalInputTokens = rec.TotalInputTokens
+	s.totalOutputTokens = rec.TotalOutputTokens
+	s.totalCacheRead = rec.TotalCacheRead
+	s.totalCacheWrite = rec.TotalCacheWrite
+	s.attachRecord = rec
+}
+
+// emitReplay rebuilds the client's chat viewport for an attached session and
+// applies restore-time validation (model changed, workflow missing). Called
+// from Run() after initBrain, when s.model and s.workflows are resolved.
+func (s *Session) emitReplay() {
+	rec := s.attachRecord
+	if rec == nil {
+		return
+	}
+	s.attachRecord = nil
+
+	var warnings []string
+
+	// Model: attach resumes on the current default (s.model, resolved by
+	// initBrain). Warn if the saved model differed.
+	if rec.Model != "" && rec.Model != s.model {
+		warnings = append(warnings, fmt.Sprintf("This conversation was saved with model %q; switched to your current default %q.", rec.Model, s.model))
+	}
+
+	// Workflow: if the saved workflow no longer exists, fall back to chat mode.
+	if s.sessionMode == "workflow" && s.activeWorkflow != "" {
+		found := false
+		for _, w := range s.workflows {
+			if w.Name == s.activeWorkflow {
+				found = true
+				break
+			}
+		}
+		if !found {
+			warnings = append(warnings, fmt.Sprintf("Workflow %q no longer exists; this session has been switched to chat mode.", s.activeWorkflow))
+			s.sessionMode = "chat"
+			s.activeWorkflow = ""
+		}
+	}
+
+	s.mu.Lock()
+	msgs := make([]llm.MessageParam, len(s.messages))
+	copy(msgs, s.messages)
+	plan := s.activePlan
+	s.mu.Unlock()
+
+	s.todoMu.RLock()
+	todos := make([]protocol.TodoItem, len(s.todoList))
+	copy(todos, s.todoList)
+	s.todoMu.RUnlock()
+
+	s.emit("event.replay", protocol.EventReplay{
+		Messages:       buildReplayMessages(msgs),
+		Todos:          todos,
+		ActivePlan:     plan,
+		Model:          s.model,
+		SessionMode:    s.sessionMode,
+		ActiveWorkflow: s.activeWorkflow,
+		Warnings:       warnings,
+	})
+
+	// Persist any fallback (mode/model) so the on-disk record reflects reality.
+	s.persist()
+}
+
+// buildReplayMessages projects llm history into the wire-stable replay shape.
+// Empty assistant/user messages (no renderable blocks) are skipped.
+func buildReplayMessages(msgs []llm.MessageParam) []protocol.ReplayMessage {
+	out := make([]protocol.ReplayMessage, 0, len(msgs))
+	for _, m := range msgs {
+		rm := protocol.ReplayMessage{Role: string(m.Role)}
+		for _, b := range m.Content {
+			switch b.Type {
+			case llm.BlockText:
+				if strings.TrimSpace(b.Text) == "" {
+					continue
+				}
+				rm.Blocks = append(rm.Blocks, protocol.ReplayBlock{Kind: "text", Text: b.Text})
+			case llm.BlockThinking:
+				if strings.TrimSpace(b.Text) == "" {
+					continue
+				}
+				rm.Blocks = append(rm.Blocks, protocol.ReplayBlock{Kind: "thinking", Text: b.Text})
+			case llm.BlockToolUse:
+				rm.Blocks = append(rm.Blocks, protocol.ReplayBlock{
+					Kind:     "tool_use",
+					ToolID:   b.ID,
+					ToolName: b.Name,
+					Input:    b.Input,
+				})
+			case llm.BlockToolResult:
+				rm.Blocks = append(rm.Blocks, protocol.ReplayBlock{
+					Kind:    "tool_result",
+					ToolID:  b.ToolUseID,
+					Output:  b.Output,
+					IsError: b.IsError,
+				})
+			}
+		}
+		if len(rm.Blocks) > 0 {
+			out = append(out, rm)
+		}
+	}
+	return out
+}

@@ -58,24 +58,24 @@ const (
 // and adapters drop the marker. OpenRouter forwards it when routing to
 // Anthropic-family models.
 type CacheControl struct {
-	Type string // currently always "ephemeral"
+	Type string `json:"type"` // currently always "ephemeral"
 }
 
 // ContentBlock is one element of message content. The fields used depend
 // on Type — see the const docs for each variant.
 type ContentBlock struct {
-	Type         ContentBlockType
-	Text         string         // BlockText, BlockThinking
-	ID           string         // BlockToolUse
-	Name         string         // BlockToolUse
-	Input        map[string]any // BlockToolUse — already-parsed; never a raw JSON string
-	ToolUseID    string         // BlockToolResult
-	Output       string         // BlockToolResult
-	IsError      bool           // BlockToolResult
-	MediaType    string         // BlockImage (e.g. "image/png")
-	Data         string         // BlockImage (base64-encoded payload)
-	Signature    string         // BlockThinking — Anthropic signature or OpenAI reasoning-item ID
-	CacheControl *CacheControl
+	Type         ContentBlockType `json:"type"`
+	Text         string           `json:"text,omitempty"`        // BlockText, BlockThinking
+	ID           string           `json:"id,omitempty"`          // BlockToolUse
+	Name         string           `json:"name,omitempty"`        // BlockToolUse
+	Input        map[string]any   `json:"input,omitempty"`       // BlockToolUse — already-parsed; never a raw JSON string
+	ToolUseID    string           `json:"tool_use_id,omitempty"` // BlockToolResult
+	Output       string           `json:"output,omitempty"`      // BlockToolResult
+	IsError      bool             `json:"is_error,omitempty"`    // BlockToolResult
+	MediaType    string           `json:"media_type,omitempty"`  // BlockImage (e.g. "image/png")
+	Data         string           `json:"data,omitempty"`        // BlockImage (base64-encoded payload)
+	Signature    string           `json:"signature,omitempty"`   // BlockThinking — Anthropic signature or OpenAI reasoning-item ID
+	CacheControl *CacheControl    `json:"cache_control,omitempty"`
 }
 
 // SystemBlock is one block of the system prompt.
@@ -86,8 +86,8 @@ type SystemBlock struct {
 
 // MessageParam is one turn in the conversation history.
 type MessageParam struct {
-	Role    Role
-	Content []ContentBlock
+	Role    Role           `json:"role"`
+	Content []ContentBlock `json:"content"`
 }
 
 // ToolParam describes one tool exposed to the model.

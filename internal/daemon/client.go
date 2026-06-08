@@ -3,6 +3,7 @@ package daemon
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -103,6 +104,29 @@ func (c *Client) Ping() bool {
 		return false
 	}
 	return resp["status"] == "ok"
+}
+
+// ListSessions returns the persisted open sessions for cwd, so the TUI can
+// reopen them on launch. Sessions are stored globally (~/.vix/sessions) and
+// filtered by cwd daemon-side.
+func (c *Client) ListSessions(cwd, configDir string) ([]protocol.SessionSummary, error) {
+	resp, err := c.sendRequest(map[string]any{
+		"command":    "session.list",
+		"cwd":        cwd,
+		"config_dir": configDir,
+	})
+	if err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(resp["sessions"])
+	if err != nil {
+		return nil, err
+	}
+	var out []protocol.SessionSummary
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ExecuteTool sends a tool execution request to the daemon.
@@ -239,6 +263,27 @@ func (sc *SessionClient) ConnectFork(cwd, configDir, model string, forceInit boo
 	})
 }
 
+// ErrSessionNotFound is returned by Attach when the daemon has no persisted
+// record for the requested ID (e.g. it was lost in a daemon restart before its
+// first flush). Callers should orphan the session rather than retry.
+var ErrSessionNotFound = errors.New("session not found")
+
+// Attach establishes a persistent connection and resumes the persisted session
+// with the given ID. On success the daemon replays the conversation via
+// event.replay. Returns ErrSessionNotFound when no record exists on disk.
+func (sc *SessionClient) Attach(cwd, configDir, model string, forceInit bool, enableAutomaticWritePermission bool, enableAutomaticDirectoryAccess bool, headless bool, attachSessionID string) error {
+	return sc.connectWith(protocol.SessionStartData{
+		CWD:                            cwd,
+		ConfigDir:                      configDir,
+		Model:                          model,
+		ForceInit:                      forceInit,
+		EnableAutomaticWritePermission: enableAutomaticWritePermission,
+		EnableAutomaticDirectoryAccess: enableAutomaticDirectoryAccess,
+		Headless:                       headless,
+		AttachSessionID:                attachSessionID,
+	})
+}
+
 // connectWith dials the daemon and starts a session with the given start data.
 func (sc *SessionClient) connectWith(startData protocol.SessionStartData) error {
 	conn, err := net.Dial("unix", sc.socketPath)
@@ -267,8 +312,16 @@ func (sc *SessionClient) connectWith(startData protocol.SessionStartData) error 
 	}
 	if event.Type == "event.error" {
 		conn.Close()
-		data, _ := json.Marshal(event.Data)
-		return fmt.Errorf("session start failed: %s", string(data))
+		raw, _ := json.Marshal(event.Data)
+		var ee protocol.EventError
+		json.Unmarshal(raw, &ee)
+		if ee.Code == "session_not_found" {
+			return ErrSessionNotFound
+		}
+		if ee.Message != "" {
+			return fmt.Errorf("session start failed: %s", ee.Message)
+		}
+		return fmt.Errorf("session start failed: %s", string(raw))
 	}
 	if event.Type == "event.session_started" {
 		data, _ := json.Marshal(event.Data)

@@ -3,6 +3,9 @@ package daemon
 import (
 	"os"
 	"path/filepath"
+
+	"github.com/get-vix/vix/internal/config"
+	"github.com/get-vix/vix/internal/protocol"
 )
 
 // RegisterBuiltinHandlers registers ping, init, and force_init handlers.
@@ -38,5 +41,23 @@ func RegisterBuiltinHandlers(s *Server) {
 			return map[string]any{"status": "error", "message": "brain.init handler not registered"}, nil
 		}
 		return handler(map[string]any{"params": map[string]any{"project_path": path}})
+	})
+
+	// session.list returns the persisted open sessions for the requesting cwd,
+	// so a freshly launched TUI can reopen them. Filtering by cwd keeps the
+	// global store (~/.vix/sessions) project-scoped at the UI layer.
+	s.RegisterHandler("session.list", func(data map[string]any) (map[string]any, error) {
+		cwd, _ := data["cwd"].(string)
+		configDir, _ := data["config_dir"].(string)
+		paths := config.NewVixPaths(configDir, s.homeVixDir, cwd)
+		recs := listOpenSessionRecords(paths)
+		summaries := make([]protocol.SessionSummary, 0, len(recs))
+		for _, r := range recs {
+			if cwd != "" && r.CWD != cwd {
+				continue
+			}
+			summaries = append(summaries, r.summary())
+		}
+		return map[string]any{"status": "ok", "sessions": summaries}, nil
 	})
 }

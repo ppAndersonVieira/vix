@@ -131,6 +131,41 @@ func (p VixPaths) Logs() string {
 	return filepath.Join(p.home, "logs")
 }
 
+// Sessions returns the directory where persisted session records live.
+// Sessions are stored globally (not project-scoped): override mode uses
+// override/sessions; normal mode uses home/sessions (empty if home is
+// unavailable). Each record carries its own cwd so the daemon can filter the
+// open list by the launching project.
+func (p VixPaths) Sessions() string {
+	if p.override != "" {
+		return filepath.Join(p.override, "sessions")
+	}
+	if p.home == "" {
+		return ""
+	}
+	return filepath.Join(p.home, "sessions")
+}
+
+// SessionsOpen returns the subdirectory holding open (TUI-visible) sessions.
+// Empty when Sessions() is empty.
+func (p VixPaths) SessionsOpen() string {
+	base := p.Sessions()
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, "open")
+}
+
+// SessionsClosed returns the subdirectory holding closed sessions (retained on
+// disk but not reopened on launch). Empty when Sessions() is empty.
+func (p VixPaths) SessionsClosed() string {
+	base := p.Sessions()
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, "closed")
+}
+
 // AccessStatsDB returns the sqlite path for per-session tool access stats.
 // Override mode: override/access_stats.db.
 // Normal mode:   cwd/.vix/access_stats.db.
