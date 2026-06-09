@@ -923,10 +923,21 @@ func (a *AgentRunner) Send(
 			if attempt == maxRetries-1 {
 				return "", fmt.Errorf("%s", reason)
 			}
-			delaySec := math.Min(math.Pow(2, float64(attempt)), 60)
-			jitter := rand.Float64() * 0.5
-			wait := time.Duration((delaySec + jitter) * float64(time.Second))
-			waitSecs := int(math.Ceil(delaySec + jitter))
+			var wait time.Duration
+			var waitSecs int
+			if ra := rateLimitRetryAfter(streamErr); ra > 0 {
+				wait = ra
+				waitSecs = int(math.Ceil(ra.Seconds()))
+			} else {
+				backoffCap := 60.0
+				if isRateLimitError(streamErr) {
+					backoffCap = 300.0
+				}
+				delaySec := math.Min(math.Pow(2, float64(attempt)), backoffCap)
+				jitter := rand.Float64() * 0.5
+				wait = time.Duration((delaySec + jitter) * float64(time.Second))
+				waitSecs = int(math.Ceil(delaySec + jitter))
+			}
 			if hooks != nil && hooks.OnRetry != nil {
 				hooks.OnRetry(attempt+1, maxRetries, waitSecs, reason)
 			}

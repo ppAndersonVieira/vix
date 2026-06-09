@@ -170,7 +170,7 @@ func main() {
 	var apiKey string
 	apiKey, _ = config.ResolveProviderKey("anthropic") // includes CLAUDE_CODE_OAUTH_TOKEN fallback
 	hasNonAnthropicKey := func() bool {
-		for _, p := range []string{"openai", "openrouter", "minimax", "mimo"} {
+		for _, p := range []string{"bedrock", "openai", "openrouter", "minimax", "mimo"} {
 			if k, _ := config.ResolveProviderKey(p); k != "" {
 				return true
 			}

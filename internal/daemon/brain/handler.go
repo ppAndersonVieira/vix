@@ -83,4 +83,3 @@ func doBrainInit(data map[string]any, cred config.Credential) (map[string]any, e
 func doBrainUpdateFiles(data map[string]any, cred config.Credential) (map[string]any, error) {
 	return map[string]any{"status": "ok"}, nil
 }
-

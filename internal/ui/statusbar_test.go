@@ -13,7 +13,7 @@ func TestFormatTokenCount(t *testing.T) {
 		{0, "0"},
 		{999, "999"},
 		{1000, "1k"},
-		{1500, "1k"},    // integer truncation, not rounding
+		{1500, "1k"}, // integer truncation, not rounding
 		{125000, "125k"},
 	}
 	for _, tt := range tests {

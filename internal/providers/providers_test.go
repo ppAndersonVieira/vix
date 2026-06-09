@@ -14,7 +14,7 @@ func TestEmbeddedLoadsAndValidates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadEmbedded: %v", err)
 	}
-	wantIDs := []string{"anthropic", "openai", "openrouter", "minimax", "mimo"}
+	wantIDs := []string{"anthropic", "openai", "openrouter", "minimax", "mimo", "bedrock"}
 	if got := reg.IDs(); len(got) != len(wantIDs) {
 		t.Fatalf("IDs = %v, want %v", got, wantIDs)
 	}
@@ -46,6 +46,7 @@ func TestGoldenProviderData(t *testing.T) {
 		{"openrouter", "openrouter", WireChatCompletions, EffortOpenAIReasoning, AuthSchemeBearer, "https://openrouter.ai/api/v1", EffortStyleReasoningEffort},
 		{"minimax", "minimax", WireChatCompletions, EffortAdaptive, AuthSchemeBearer, "https://api.minimax.io/v1", EffortStyleReasoningSplit},
 		{"mimo", "mimo", WireChatCompletions, EffortOpenAIReasoning, AuthSchemeBearer, "https://api.xiaomimimo.com/v1", EffortStyleReasoningEffort},
+		{"bedrock", "bedrock", WireMessages, EffortAdaptive, AuthSchemeBearer, "https://bedrock-runtime.us-east-1.amazonaws.com/", EffortStyleNone},
 	}
 	for _, c := range cases {
 		p, ok := reg.Lookup(c.id)
@@ -122,6 +123,7 @@ func TestParseModel(t *testing.T) {
 		{"openrouter/openai/gpt-5.1", "openrouter", "openai/gpt-5.1", false},
 		{"minimax/MiniMax-M2.7", "minimax", "MiniMax-M2.7", false},
 		{"mimo/mimo-v2.5-pro", "mimo", "mimo-v2.5-pro", false},
+		{"bedrock/anthropic.claude-sonnet-4-5-v2:0", "bedrock", "anthropic.claude-sonnet-4-5-v2:0", false},
 		{"", "", "", true},
 		{"claude-sonnet-4-6", "", "", true},
 		{"gemini/pro", "", "", true},

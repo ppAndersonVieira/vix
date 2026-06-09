@@ -203,4 +203,3 @@ func (c *CommandPalette) View(width, height int, s Styles) string {
 
 	return box
 }
-

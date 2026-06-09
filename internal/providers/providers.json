@@ -543,6 +543,23 @@
         { "spec": "mimo/mimo-v2.5-tts-voiceclone", "display_name": "Mimo v2.5 Tts Voiceclone" },
         { "spec": "mimo/mimo-v2.5-tts-voicedesign", "display_name": "Mimo v2.5 Tts Voicedesign" }
       ]
+    },
+    {
+      "id": "bedrock",
+      "display_name": "AWS Bedrock",
+      "model_prefix": "bedrock",
+      "wire_format": "messages",
+      "effort_policy": "adaptive",
+      "inference": {
+        "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com/",
+        "auth_scheme": "bearer"
+      },
+      "credential_methods": [
+        { "kind": "api_key", "env_var": "AWS_BEARER_TOKEN_BEDROCK", "keyring": "bedrock-bearer-token" }
+      ],
+      "models": [
+        { "spec": "bedrock/anthropic.claude-sonnet-4-5-v2:0", "display_name": "Claude Sonnet 4.5 v2" }
+      ]
     }
   ],
   "auth_logins": [

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/get-vix/vix/internal/daemon/brain"
+	"github.com/google/uuid"
 
 	_ "modernc.org/sqlite"
 )

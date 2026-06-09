@@ -791,9 +791,9 @@ func TestLoadProjectConfig_DenyList_NewSchema(t *testing.T) {
 		t.Fatalf("expected 3 unique url entries, got %d: %v", len(cfg.DenyURLs), cfg.DenyURLs)
 	}
 	wantURLs := map[string]bool{
-		"bad.example.com":                    true,
-		"https://api.example.com/admin":      true,
-		"another-bad.example.org":            true,
+		"bad.example.com":               true,
+		"https://api.example.com/admin": true,
+		"another-bad.example.org":       true,
 	}
 	for _, u := range cfg.DenyURLs {
 		if !wantURLs[u] {

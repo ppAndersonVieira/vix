@@ -314,8 +314,8 @@ func (b *fdGlobBackend) Run(ctx context.Context, patterns, paths []string, cwd, 
 
 // --- Factory functions ---
 
-func logToolFound(name string)    { log.Printf("\033[32m[tools] ✓ %s found\033[0m", name) }
-func logToolMissing(name string)  { log.Printf("\033[31m[tools] ✗ %s not found in PATH\033[0m", name) }
+func logToolFound(name string)   { log.Printf("\033[32m[tools] ✓ %s found\033[0m", name) }
+func logToolMissing(name string) { log.Printf("\033[31m[tools] ✗ %s not found in PATH\033[0m", name) }
 
 func newGrepRunner(backend string) grepRunner {
 	switch backend {

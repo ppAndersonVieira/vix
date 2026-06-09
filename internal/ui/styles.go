@@ -25,10 +25,10 @@ var (
 
 var (
 	// Brand colors (true color hex for consistent identity)
-	colorPrimary    = lipgloss.Color(primaryHex)      // Coral
-	colorSecondary  = lipgloss.Color(secondaryHex)     // Sky blue
-	colorAccentWarm = lighten(primaryHex, 0.3)         // Light coral (derived)
-	colorAccentCool = lighten(secondaryHex, 0.3)       // Light sky blue (derived)
+	colorPrimary    = lipgloss.Color(primaryHex)   // Coral
+	colorSecondary  = lipgloss.Color(secondaryHex) // Sky blue
+	colorAccentWarm = lighten(primaryHex, 0.3)     // Light coral (derived)
+	colorAccentCool = lighten(secondaryHex, 0.3)   // Light sky blue (derived)
 
 	// Semantic colors (ANSI for terminal compatibility)
 	colorError   = lipgloss.Color("1") // Red
@@ -139,10 +139,10 @@ var (
 
 	// History
 	historyArrowStyle = lipgloss.NewStyle().
-		Foreground(colorPrimary)
+				Foreground(colorPrimary)
 
 	historyBorderStyle = lipgloss.NewStyle().
-		Foreground(colorSecondary)
+				Foreground(colorSecondary)
 
 	// Plan prompt
 	planPromptActionStyle = lipgloss.NewStyle().
@@ -160,8 +160,8 @@ var (
 					Background(colorStructural)
 
 	questionPanelCursorStyle = lipgloss.NewStyle().
-				Foreground(colorPrimary).
-				Bold(true)
+					Foreground(colorPrimary).
+					Bold(true)
 
 	questionPanelTabActiveStyle = lipgloss.NewStyle().
 					Foreground(lipgloss.Color("0")).
@@ -176,9 +176,9 @@ var (
 // On light backgrounds, "white" text becomes ANSI 0 (black) and "dim" becomes ANSI 7 (silver).
 type Styles struct {
 	// Adaptive colors for inline use
-	ColorWhite       color.Color
-	ColorDimGray     color.Color
-	ColorBlurBorder  color.Color
+	ColorWhite      color.Color
+	ColorDimGray    color.Color
+	ColorBlurBorder color.Color
 
 	// Styles using colorWhite
 	ToolResultStyle            lipgloss.Style
@@ -227,12 +227,12 @@ type Styles struct {
 func NewStyles(hasDarkBG bool) Styles {
 	white := lipgloss.Color("15")
 	dimGray := lipgloss.Color("245")
-	lightBlue := lipgloss.Color("117") // dark BG: bright sky blue
+	lightBlue := lipgloss.Color("117")     // dark BG: bright sky blue
 	blurredBorder := lipgloss.Color("240") // dark: subtle grey
 	if !hasDarkBG {
 		white = lipgloss.Color("0")
 		dimGray = lipgloss.Color("7")
-		lightBlue = lipgloss.Color("33") // light BG: saturated blue that reads on white
+		lightBlue = lipgloss.Color("33")      // light BG: saturated blue that reads on white
 		blurredBorder = lipgloss.Color("250") // light: lighter grey for clear contrast vs black
 	}
 

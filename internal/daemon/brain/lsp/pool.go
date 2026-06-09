@@ -45,7 +45,7 @@ type Pool struct {
 	clients    map[string]*Client
 	configs    map[string]*ServerConfig
 	formatters map[string]*FormatterConfig
-	extMap     map[string]string   // maps file extension (e.g. ".go") to language name (e.g. "go")
+	extMap     map[string]string    // maps file extension (e.g. ".go") to language name (e.g. "go")
 	failedAt   map[string]time.Time // languages that failed to start + when
 	rootDir    string
 	ctx        context.Context
