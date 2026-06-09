@@ -13,6 +13,7 @@ import (
 
 	"github.com/get-vix/vix/internal/daemon"
 	"github.com/get-vix/vix/internal/protocol"
+	"github.com/get-vix/vix/internal/telemetry"
 )
 
 // OutputFormat controls how the headless result is printed.
@@ -67,7 +68,7 @@ type usageStats struct {
 
 // Run executes a single prompt in headless mode, consuming session events
 // and producing output in the requested format.
-func Run(session *daemon.SessionClient, prompt string, format OutputFormat, workflow string) error {
+func Run(session *daemon.SessionClient, prompt string, format OutputFormat, workflow string, model string) error {
 	start := time.Now()
 
 	// Handle signals for clean shutdown
@@ -91,6 +92,7 @@ func Run(session *daemon.SessionClient, prompt string, format OutputFormat, work
 			return fmt.Errorf("send input: %w", err)
 		}
 	}
+	telemetry.TrackTurn(model)
 
 	var (
 		textBuf  strings.Builder

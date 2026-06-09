@@ -227,6 +227,10 @@ func main() {
 		}
 	}()
 	telemetry.TrackTUIStarted(appMode, Version)
+	// Record session end on shutdown. Registered after the Shutdown defer so it
+	// runs first on unwind (before Shutdown flushes); the endOnce guard inside
+	// keeps it single-fire even on the panic path above.
+	defer telemetry.TrackTUIEnded()
 	ui.Version = Version
 
 	var session *daemon.SessionClient
@@ -339,7 +343,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: headless mode requires a daemon connection (cannot use --test)\n")
 			os.Exit(1)
 		}
-		if err := headless.Run(session, *prompt, format, *workflow); err != nil {
+		if err := headless.Run(session, *prompt, format, *workflow, cfg.Model); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}

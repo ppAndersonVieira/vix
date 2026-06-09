@@ -19,6 +19,13 @@ const (
 	posthogHost    = "https://us.i.posthog.com"
 	keyringService = "vix"
 	keyringUser    = "device-id"
+
+	// sessionIdleTimeout mirrors PostHog's own session convention: after this
+	// much inactivity the next event starts a fresh session. This also keeps us
+	// safely inside PostHog's hard rule that a custom UUIDv7 session ID is only
+	// valid for events within 24h of its embedded timestamp — you can't idle
+	// past the timeout without rotating to a new ID.
+	sessionIdleTimeout = 30 * time.Minute
 )
 
 // Config controls telemetry initialization.
@@ -43,6 +50,15 @@ var (
 	mode      string
 	initOnce  sync.Once
 	closeOnce sync.Once
+	endOnce   sync.Once
+
+	// Session rotation state, guarded by sessionMu. Track() (via commonProps)
+	// is called from multiple goroutines — the TUI's Bubble Tea loop, the
+	// headless runner, crash handlers — so all access is locked.
+	sessionMu        sync.Mutex
+	sessionID        string
+	sessionStartTime time.Time
+	lastEventTime    time.Time
 )
 
 // Version returns the build version string set via Init (or "dev" if unset).
@@ -77,6 +93,16 @@ func Init(cfg Config) {
 			return
 		}
 		deviceID = id
+
+		// Seed the first session. Generating the ID here (before any Track call)
+		// guarantees its embedded UUIDv7 timestamp is at or before the first
+		// event, as PostHog requires. currentSessionID rotates it later on idle.
+		now := time.Now()
+		sessionMu.Lock()
+		sessionID = newSessionID()
+		sessionStartTime = now
+		lastEventTime = now
+		sessionMu.Unlock()
 
 		c, err := posthog.NewWithConfig(embeddedAPIKey, posthog.Config{
 			Endpoint:  posthogHost,
@@ -142,7 +168,47 @@ func commonProps() posthog.Properties {
 		Set("version", version).
 		Set("os", runtime.GOOS).
 		Set("arch", runtime.GOARCH).
-		Set("mode", mode)
+		Set("mode", mode).
+		Set("$session_id", currentSessionID(time.Now()))
+}
+
+// newSessionID mints a session ID. PostHog requires a UUIDv7 for custom session
+// IDs; NewV7 only fails if the system entropy source does, in which case we fall
+// back to a UUIDv4 (PostHog won't use it for session aggregation but still
+// ingests the event) rather than dropping telemetry.
+func newSessionID() string {
+	if sid, err := uuid.NewV7(); err == nil {
+		return sid.String()
+	}
+	return uuid.New().String()
+}
+
+// currentSessionID returns the active session ID, rotating to a fresh one when
+// more than sessionIdleTimeout has elapsed since the last event, and records now
+// as the latest activity. Called once per event via commonProps, so any gap in
+// emitted events longer than the timeout (e.g. a TUI left idle overnight) splits
+// the run into separate PostHog sessions.
+func currentSessionID(now time.Time) string {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	if sessionID == "" || now.Sub(lastEventTime) > sessionIdleTimeout {
+		sessionID = newSessionID()
+		sessionStartTime = now
+	}
+	lastEventTime = now
+	return sessionID
+}
+
+// sessionDurationSeconds returns the wall-clock seconds since the current
+// session started. Reported on tui_ended for our own convenience; PostHog also
+// computes $session_duration from the event timestamps.
+func sessionDurationSeconds() int {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	if sessionStartTime.IsZero() {
+		return 0
+	}
+	return int(time.Since(sessionStartTime).Seconds())
 }
 
 // CaptureException reports an error or panic to PostHog error tracking.
