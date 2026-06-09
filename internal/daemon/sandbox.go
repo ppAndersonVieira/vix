@@ -97,13 +97,17 @@ func seatbeltProfile(cwd string, extraDirs []string) string {
 	b.WriteString("(version 1)\n(deny default)\n\n")
 
 	b.WriteString(";; Allow process execution and standard operations\n")
-	b.WriteString("(allow process-exec)\n")
+	b.WriteString("(allow process-exec*)\n")
 	b.WriteString("(allow process-fork)\n")
 	b.WriteString("(allow signal)\n")
 	b.WriteString("(allow sysctl-read)\n")
 	b.WriteString("(allow mach-lookup)\n")
-	b.WriteString("(allow ipc-posix-shm-read-data)\n")
-	b.WriteString("(allow ipc-posix-shm-write-data)\n\n")
+	// mach-register lets child processes register mach services via the
+	// bootstrap server. Needed by multi-process tools such as headless Chrome
+	// (its crashpad handler does bootstrap_check_in); without it they fail to
+	// start under the sandbox.
+	b.WriteString("(allow mach-register)\n")
+	b.WriteString("(allow ipc-posix-shm*)\n\n")
 
 	b.WriteString(";; cwd: read-write\n")
 	fmt.Fprintf(&b, "(allow file-read* (subpath %q))\n", realCwd)
