@@ -40,6 +40,15 @@ type tabBlinkMsg struct{ gen int }
 
 const tabBlinkHalfPeriod = 500 * time.Millisecond
 
+// sessionsSpinnerMsg advances the sessions-list loading spinner.
+// gen must match Model.sessionsSpinnerGen; stale ticks are silently dropped.
+type sessionsSpinnerMsg struct{ gen int }
+
+// sessionsSpinnerPeriod sets the sessions-list spinner cadence. A list spinner
+// doesn't need the chat spinner's 30fps; 12fps reads as smooth and is cheap.
+const sessionsSpinnerPeriod = time.Second / 12
+
+
 // ThinkingAnim renders a spinner row: each character cycles through braille
 // spinner frames with a phase offset so a wave ripples across the bar.
 // Colors follow a gradient across the bar.

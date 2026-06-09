@@ -43,8 +43,15 @@ var waitingBadge = lipgloss.NewStyle().Background(colorSecondary).Foreground(lip
 // unreadDotStyle styles the ● indicator for sessions with unread messages.
 var unreadDotStyle = lipgloss.NewStyle().Foreground(colorSecondary)
 
-// renderSessionsView renders the sessions list overview.
-func renderSessionsView(sessions []*SessionState, width, height int, s Styles, selectedRow int) string {
+// sessionsSpinnerStyle styles the loading spinner shown for sessions that are
+// actively working. Primary color distinguishes it from the secondary-tinted
+// unread dot.
+var sessionsSpinnerStyle = lipgloss.NewStyle().Foreground(colorPrimary)
+
+// renderSessionsView renders the sessions list overview. spinnerFrame is the
+// current loading-spinner glyph (empty when the spinner is inactive); it is
+// shown in a busy session's leading-indicator slot in place of the unread dot.
+func renderSessionsView(sessions []*SessionState, width, height int, s Styles, selectedRow int, spinnerFrame string) string {
 	const colSession = 10
 	const colRunning = 10
 
@@ -120,6 +127,10 @@ func renderSessionsView(sessions []*SessionState, width, height int, s Styles, s
 		}
 
 		hasUnread := sess.unreadCount > 0
+		busy := spinnerFrame != "" &&
+			(sess.agentState == StateStreaming ||
+				sess.agentState == StateToolExecuting ||
+				sess.agentState == StatePlanExecuting)
 		needsInput := sess.agentState == StateConfirmPending || sess.agentState == StateUserQuestion
 		var badgeSlot string
 		if needsInput {
@@ -129,11 +140,15 @@ func renderSessionsView(sessions []*SessionState, width, height int, s Styles, s
 		}
 		plainCols := fmt.Sprintf("%-*s  %-*s  %-*s", colSession, sessionCol, colMessage, msgCol, colRunning, runningCol) + badgeSlot
 		if rowIdx == selectedRow {
-			dotChar := " "
-			if hasUnread {
-				dotChar = "●"
+			lead := " "
+			if busy {
+				lead = spinnerFrame
+			} else if hasUnread {
+				lead = "●"
 			}
-			rows = append(rows, s.TabAlertStyle.Render(dotChar+" "+plainCols))
+			rows = append(rows, s.TabAlertStyle.Render(lead+" "+plainCols))
+		} else if busy {
+			rows = append(rows, sessionsSpinnerStyle.Render(spinnerFrame)+" "+plainCols)
 		} else if hasUnread {
 			rows = append(rows, unreadDotStyle.Render("●")+" "+plainCols)
 		} else {

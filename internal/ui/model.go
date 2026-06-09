@@ -328,6 +328,14 @@ type Model struct {
 	tabAlertBlinkOn  bool
 	tabAlertBlinkGen int
 
+	// Sessions-list loading spinner. A single shared ticker animates the
+	// per-row indicator for sessions that are actively working. It runs only
+	// while the Sessions tab is the active view AND at least one session is
+	// busy, so it never animates for sessions the user can't see.
+	sessionsSpinnerActive bool
+	sessionsSpinnerStep   int
+	sessionsSpinnerGen    int // bumped on stop; invalidates in-flight ticks
+
 	// sessionsTabUnseen marks that a message arrived while the Sessions tab was
 	// not focused; it tints the Sessions tab title secondary (static, not
 	// blinking) and is cleared when the user visits the Sessions tab.
@@ -1110,6 +1118,7 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			evCmds := m.applyEventToSession(idx, msg.event)
 			cmds = append(cmds, evCmds...)
 			cmds = append(cmds, m.maybeStartTabAlertBlink())
+			cmds = append(cmds, m.maybeStartSessionsSpinner())
 		}
 		return m, tea.Batch(cmds...)
 
@@ -1324,6 +1333,19 @@ func (m Model) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tabAlertBlinkOn = false
 		m.tabAlertBlinkGen++
 		return m, nil
+
+	case sessionsSpinnerMsg:
+		if msg.gen != m.sessionsSpinnerGen {
+			return m, nil
+		}
+		m.sessionsSpinnerStep++
+		// Re-gate every frame: keep ticking only while the list is visible and
+		// work is ongoing, otherwise stop (and bump gen so this loop dies).
+		if m.activeTab == TabKindSessions && m.hasBusySessions() {
+			return m, m.sessionsSpinnerTick()
+		}
+		m.stopSessionsSpinner()
+		return m, nil
 	}
 
 	// Forward unhandled messages to the active input for cursor blink
@@ -1363,10 +1385,15 @@ func (m *Model) markSessionRead(sess *SessionState) {
 // returning any command to run (e.g. resuming the chat thinking animation).
 func (m *Model) switchTab(k TabKind) tea.Cmd {
 	m.activeTab = k
+	if k != TabKindSessions {
+		// Leaving the Sessions tab: no reason to animate a list nobody sees.
+		m.stopSessionsSpinner()
+	}
 	switch k {
 	case TabKindSessions:
 		m.sessionsTabUnseen = false
 		m.syncSessionsSelected()
+		return m.maybeStartSessionsSpinner()
 	case TabKindChat:
 		if sess := m.currentSession(); sess != nil {
 			m.markSessionRead(sess)
@@ -2378,7 +2405,11 @@ func (m Model) View() tea.View {
 	switch m.activeTab {
 	case TabKindSessions:
 		sessionsHeight := m.height - layout.TabBarHeight - layout.StatusBarHeight
-		sv := renderSessionsView(m.sessions, m.width, sessionsHeight, m.styles, m.sessionsSelected)
+		spinnerFrame := ""
+		if m.sessionsSpinnerActive {
+			spinnerFrame = string(animFrames[m.sessionsSpinnerStep%len(animFrames)])
+		}
+		sv := renderSessionsView(m.sessions, m.width, sessionsHeight, m.styles, m.sessionsSelected, spinnerFrame)
 		uv.NewStyledString(sv).Draw(canvas, image.Rect(0, y, m.width, y+sessionsHeight))
 		y += sessionsHeight
 
@@ -3206,7 +3237,7 @@ func (m *Model) doCloseSession(sessionIdx int) (Model, tea.Cmd) {
 	m.activeTab = TabKindSessions
 	m.syncSessionsSelected()
 	m.state = StateWaitingForInput
-	return *m, reconnectCmd
+	return *m, tea.Batch(reconnectCmd, m.maybeStartSessionsSpinner())
 }
 
 // effectiveChatWidth returns the panel-aware total chat width — the single
@@ -3324,6 +3355,45 @@ func (m *Model) tabBlinkTick() tea.Cmd {
 	gen := m.tabAlertBlinkGen
 	return tea.Tick(tabBlinkHalfPeriod, func(time.Time) tea.Msg {
 		return tabBlinkMsg{gen: gen}
+	})
+}
+
+// hasBusySessions reports whether any session is actively working (streaming,
+// running a tool, or executing a plan) — the states the sessions-list spinner
+// animates.
+func (m *Model) hasBusySessions() bool {
+	for _, sess := range m.sessions {
+		switch sess.agentState {
+		case StateStreaming, StateToolExecuting, StatePlanExecuting:
+			return true
+		}
+	}
+	return false
+}
+
+// maybeStartSessionsSpinner starts the sessions-list loading spinner when the
+// Sessions tab is active and at least one session is busy. No-op otherwise (and
+// when already running), so it is safe to call on every relevant state change.
+func (m *Model) maybeStartSessionsSpinner() tea.Cmd {
+	if m.sessionsSpinnerActive || m.activeTab != TabKindSessions || !m.hasBusySessions() {
+		return nil
+	}
+	m.sessionsSpinnerActive = true
+	return m.sessionsSpinnerTick()
+}
+
+// stopSessionsSpinner halts the spinner loop and bumps the generation so any
+// in-flight tick already queued in Bubble Tea's channel is ignored on arrival.
+func (m *Model) stopSessionsSpinner() {
+	m.sessionsSpinnerActive = false
+	m.sessionsSpinnerGen++
+}
+
+// sessionsSpinnerTick schedules the next sessions-list spinner frame.
+func (m *Model) sessionsSpinnerTick() tea.Cmd {
+	gen := m.sessionsSpinnerGen
+	return tea.Tick(sessionsSpinnerPeriod, func(time.Time) tea.Msg {
+		return sessionsSpinnerMsg{gen: gen}
 	})
 }
 
