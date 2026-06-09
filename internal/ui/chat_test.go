@@ -16,7 +16,7 @@ func TestExtractFilePathFromSummary(t *testing.T) {
 		{"write_file", "config.yaml (100 chars)", "config.yaml"},
 		{"read_file", "main.go:10-20", "main.go"},
 		{"read_file", "test.txt", "test.txt"},
-		{"bash", "ls -la", ""}, // Not a file operation
+		{"bash", "ls -la", ""},  // Not a file operation
 		{"grep", "pattern", ""}, // Not a file operation
 	}
 

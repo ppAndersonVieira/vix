@@ -240,8 +240,8 @@ func isUnderAnyReal(resolvedReal, cwd string, allowedDirs []string) bool {
 }
 
 var (
-	cdPattern   = regexp.MustCompile(`\bcd\s+["']?([^\s"';&|]+)`)
-	absPathPat  = regexp.MustCompile(`(?:^|\s|=|:)(/[^\s"';&|<>]+)`)
+	cdPattern    = regexp.MustCompile(`\bcd\s+["']?([^\s"';&|]+)`)
+	absPathPat   = regexp.MustCompile(`(?:^|\s|=|:)(/[^\s"';&|<>]+)`)
 	tildePathPat = regexp.MustCompile(`(?:^|\s|=)~/([^\s"';&|<>]+)`)
 )
 

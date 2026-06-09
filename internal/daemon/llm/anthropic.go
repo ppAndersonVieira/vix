@@ -70,11 +70,11 @@ func NewAnthropic(cfg Config) (Client, error) {
 	}, nil
 }
 
-func (a *anthropicClient) Provider() ProviderID       { return ProviderAnthropic }
-func (a *anthropicClient) Model() string              { return a.model }
+func (a *anthropicClient) Provider() ProviderID          { return ProviderAnthropic }
+func (a *anthropicClient) Model() string                 { return a.model }
 func (a *anthropicClient) Credential() config.Credential { return a.cred }
-func (a *anthropicClient) MaxTokens() int64           { return a.maxTokens }
-func (a *anthropicClient) Effort() string             { return a.effort }
+func (a *anthropicClient) MaxTokens() int64              { return a.maxTokens }
+func (a *anthropicClient) Effort() string                { return a.effort }
 
 func (a *anthropicClient) StreamMessage(
 	ctx context.Context,

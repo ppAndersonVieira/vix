@@ -33,9 +33,9 @@ func styledConfig(base string) ansi.StyleConfig {
 }
 
 var (
-	codeBlockRe    = regexp.MustCompile("(?s)```(\\w*)\\n(.*?)```")
-	ansiRe         = regexp.MustCompile(`\x1b\[[0-9;]*m`)
-	trailingPadRe  = regexp.MustCompile(`(?:\x1b\[[0-9;]*m| )+$`)
+	codeBlockRe   = regexp.MustCompile("(?s)```(\\w*)\\n(.*?)```")
+	ansiRe        = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	trailingPadRe = regexp.MustCompile(`(?:\x1b\[[0-9;]*m| )+$`)
 	// emptyTableRe matches markdown tables with only a header row and separator (no data rows).
 	// It matches: | header | ... |\n| --- | ... |\n followed by a blank line or EOF.
 	emptyTableRe = regexp.MustCompile(`(?m)(\|[^\n]+\|\n\|[\s:\-|]+\|\n)(\n|\z)`)
@@ -43,10 +43,10 @@ var (
 
 // MarkdownRenderer wraps Glamour for rendering markdown to styled terminal output.
 type MarkdownRenderer struct {
-	renderer       *glamour.TermRenderer
-	width          int
-	hasDarkBG      bool
-	codeBoxBorder  lipgloss.Style
+	renderer      *glamour.TermRenderer
+	width         int
+	hasDarkBG     bool
+	codeBoxBorder lipgloss.Style
 }
 
 // NewMarkdownRenderer creates a new markdown renderer with the given width.

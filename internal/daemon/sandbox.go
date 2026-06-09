@@ -32,8 +32,8 @@ const (
 )
 
 var (
-	detectedSandbox     sandboxMode
-	detectSandboxOnce   sync.Once
+	detectedSandbox   sandboxMode
+	detectSandboxOnce sync.Once
 )
 
 // detectSandbox checks which sandbox mechanism is available on the current platform.
@@ -350,9 +350,9 @@ func buildRestrictedPath() string {
 		"/bin",
 		"/usr/sbin",
 		"/sbin",
-		"/opt/homebrew/bin",  // macOS ARM homebrew
+		"/opt/homebrew/bin", // macOS ARM homebrew
 		"/opt/homebrew/sbin",
-		"/usr/local/go/bin",  // Go toolchain
+		"/usr/local/go/bin", // Go toolchain
 	}
 	// Preserve any GOPATH/bin, cargo, etc. from the user's PATH
 	existing := strings.Split(os.Getenv("PATH"), ":")

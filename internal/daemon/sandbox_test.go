@@ -279,7 +279,7 @@ func TestSandboxedBashCmd_SetsWorkingDir(t *testing.T) {
 	cwd := t.TempDir()
 	ctx := context.Background()
 
-	cmd := sandboxedBashCmd(ctx,"echo hello", cwd, nil)
+	cmd := sandboxedBashCmd(ctx, "echo hello", cwd, nil)
 	if cmd.Dir != cwd {
 		t.Errorf("cmd.Dir = %q, want %q", cmd.Dir, cwd)
 	}
@@ -290,7 +290,7 @@ func TestSandboxedBashCmd_ExecutesCommand(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cmd := sandboxedBashCmd(ctx,"echo sandboxed", cwd, nil)
+	cmd := sandboxedBashCmd(ctx, "echo sandboxed", cwd, nil)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("command failed: %v\noutput: %s", err, out)
@@ -306,7 +306,7 @@ func TestSandboxedBashCmd_CanReadWriteInCwd(t *testing.T) {
 	defer cancel()
 
 	// Write a file inside cwd
-	cmd := sandboxedBashCmd(ctx,"echo test > testfile.txt && cat testfile.txt", cwd, nil)
+	cmd := sandboxedBashCmd(ctx, "echo test > testfile.txt && cat testfile.txt", cwd, nil)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("command failed: %v\noutput: %s", err, out)

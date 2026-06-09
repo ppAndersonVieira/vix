@@ -8,6 +8,7 @@ type ProviderID string
 
 const (
 	ProviderAnthropic  ProviderID = "anthropic"
+	ProviderBedrock    ProviderID = "bedrock"
 	ProviderOpenAI     ProviderID = "openai"
 	ProviderOpenRouter ProviderID = "openrouter"
 	ProviderMiniMax    ProviderID = "minimax"

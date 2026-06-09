@@ -1544,11 +1544,24 @@ func (s *Session) streamWithRetry(
 		// Flush any partial streaming content in the UI
 		s.emit("event.stream_done", protocol.EventStreamDone{})
 
-		// Calculate backoff: min(1s * 2^attempt, 60s) + jitter
-		delaySec := math.Min(math.Pow(2, float64(attempt)), 60)
-		jitter := rand.Float64() * 0.5
-		wait := time.Duration((delaySec + jitter) * float64(time.Second))
-		waitSecs := int(math.Ceil(delaySec + jitter))
+		// Calculate backoff: honour Retry-After when present, otherwise use
+		// min(1s * 2^attempt, cap) + jitter. Rate-limit (429) responses use a
+		// 300 s cap so subscription-tier accounts can wait out their window.
+		var wait time.Duration
+		var waitSecs int
+		if ra := rateLimitRetryAfter(err); ra > 0 {
+			wait = ra
+			waitSecs = int(math.Ceil(ra.Seconds()))
+		} else {
+			backoffCap := 60.0
+			if isRateLimitError(err) {
+				backoffCap = 300.0
+			}
+			delaySec := math.Min(math.Pow(2, float64(attempt)), backoffCap)
+			jitter := rand.Float64() * 0.5
+			wait = time.Duration((delaySec + jitter) * float64(time.Second))
+			waitSecs = int(math.Ceil(delaySec + jitter))
+		}
 
 		s.emit("event.retry", protocol.EventRetry{
 			Attempt:    attempt + 1,

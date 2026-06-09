@@ -26,8 +26,8 @@ type SubagentConfig struct {
 	Effort       string   // "adaptive", "low", "medium", "high", "max", or "" (inherit)
 	Tools        []string // tool name filter; nil = all tools
 	MaxTurns     int      // 0 = default (20)
-	MaxTokens      int    // per-LLM-call output token cap; 0 = default (32768)
-	SystemPrompt   string
+	MaxTokens    int      // per-LLM-call output token cap; 0 = default (32768)
+	SystemPrompt string
 }
 
 // SubagentResult holds the output of a completed subagent run.
@@ -44,20 +44,20 @@ type SubagentResult struct {
 // TurnHooks provides typed callbacks for streaming events between LLM turns.
 // All fields are optional — nil callbacks are skipped.
 type TurnHooks struct {
-	OnStreamDelta    func(delta string)
-	OnThinkingDelta  func(delta string)
-	OnStreamDone     func(inputTokens, outputTokens, cacheCreation, cacheRead, elapsedMs int64)
-	OnToolCall       func(ev protocol.EventToolCall)
-	OnToolResult     func(toolID, name string, input map[string]any, output string, isError bool)
-	OnBeforeStream   func(cancel context.CancelFunc)
+	OnStreamDelta   func(delta string)
+	OnThinkingDelta func(delta string)
+	OnStreamDone    func(inputTokens, outputTokens, cacheCreation, cacheRead, elapsedMs int64)
+	OnToolCall      func(ev protocol.EventToolCall)
+	OnToolResult    func(toolID, name string, input map[string]any, output string, isError bool)
+	OnBeforeStream  func(cancel context.CancelFunc)
 	// OnRetry is called when a retryable API error is about to be retried.
 	// Mirrors session.streamWithRetry's event.retry emission so workflow-agent
 	// retries become visible in the trajectory instead of only vixd.log.
-	OnRetry          func(attempt, maxRetries, waitSecs int, reason string)
+	OnRetry func(attempt, maxRetries, waitSecs int, reason string)
 	// OnThinkingStall is called when a thinking block exceeded its stall
 	// timeout. The caller appends a nudge message and retries; this hook
 	// lets the TUI surface the event.
-	OnThinkingStall  func(elapsedMs int64, summaryChars int)
+	OnThinkingStall func(elapsedMs int64, summaryChars int)
 }
 
 // BackgroundTask tracks an in-flight or completed background subagent.

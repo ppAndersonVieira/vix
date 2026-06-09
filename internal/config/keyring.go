@@ -385,6 +385,7 @@ func loadKeyFromEnvFile(path, varName string) string {
 	}
 	prefix := varName + "="
 	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimPrefix(strings.TrimSpace(line), "export ")
 		if strings.HasPrefix(line, prefix) {
 			return strings.TrimSpace(strings.SplitN(line, "=", 2)[1])
 		}
