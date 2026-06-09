@@ -99,6 +99,25 @@ does not reliably show the host process that launched the session, even though i
 - **No over-engineering** - keep changes minimal and focused. Don't add abstractions for one-time operations.
 - **Security** - sanitize all user inputs before shell execution. Be careful with tool execution paths.
 
+## Todo list (user-facing)
+
+The `todo_write`/`todo_read` tools back a live progress panel in the TUI, so the
+todo list is **user-facing**: it's how the user follows what the agent is doing
+in real time. Treat it as shared state that must always reflect reality, not a
+private scratchpad.
+
+- Update the list **every time** you add an item or change one. Mark an item
+  `in_progress` right before starting it and `completed` immediately after
+  finishing — don't batch status flips or let the panel lag behind actual work.
+- `todo_write` has replace semantics: send the full list each time, keeping `id`
+  values stable so items map to the same UI row across updates.
+- Keep at most one item `in_progress` at a time, and clear the list (send `[]`)
+  once the work is done so the user isn't left looking at stale entries.
+
+The daemon nudges the model if it finishes a turn with pending/in-progress todos
+(`internal/daemon/session.go`), and the panel renders from `event.todo_list_updated`
+(`internal/ui/todopanel.go`, `internal/ui/rightpanel.go`).
+
 ## Environment
 
 - **Go 1.26+** required
